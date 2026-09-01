@@ -79,11 +79,28 @@ The receiver publishes a route the same way the listener does:
 cargo run --release -- recv --out ./inbox
 ```
 
-The sender takes that blob and one or more paths:
+It prints two ways to reach it. Prefer the first:
 
 ```
-cargo run --release -- send --connect <blob> photo.jpg screenshot.png
+cargo run --release -- send --rendezvous <dht-key> photo.jpg screenshot.png
+cargo run --release -- send --connect    <blob>    photo.jpg screenshot.png
 ```
+
+`--connect` names one private route. Routes die on their own schedule, and when
+that one does the run ends — there is no way to learn its replacement, because
+the path you would ask over is the path that just died.
+
+`--rendezvous` takes a DHT record key instead. The receiver writes its current
+route blob into that record and rewrites it every time it rebuilds, so the key
+is stable: share it once and it keeps working across route deaths and receiver
+restarts. The key is kept with its owner keypair in `.veilid/recv/rendezvous`
+beside the binary, so restarting the receiver reuses the same key rather than
+minting a new one.
+
+When a route dies mid-transfer the sender re-reads the record, imports whatever
+is there now, and **resumes the same transfer** — transfers are keyed by a
+random id rather than by route, and the receiver answers a repeated manifest by
+keeping the chunks it already has. Nothing already delivered is sent twice.
 
 Completed files are written to `--out` (default `./inbox`), never overwriting:
 a second `photo.jpg` lands as `photo-1.jpg`. Both ends print what the path cost
@@ -124,6 +141,7 @@ path the question arrived on. Only the receiver has to publish a blob.
 | `--rate` | 20 | *(send)* Chunks per second. `--rate` × `--chunk` is the offered throughput; the default asks for about 320 KiB/s. |
 | `--settle-ms` | 1500 | *(send)* How long to wait after a pass before asking what is missing. Wants to be a couple of round trips of the measured RTT. |
 | `--rounds` | 20 | *(send)* Give up after this many repair passes. |
+| `--rendezvous <key>` | — | *(send)* DHT record key printed by `recv`. Survives route death; mutually exclusive with `--connect`. |
 
 The routing flags below (`--hops`, `--unsafe`, `--stability`, `--sequencing`)
 apply to `recv` and `send` too.
@@ -207,7 +225,8 @@ day, because that is what your users will get.
 - `src/roles.rs` — the two ends of the measurement, route construction, and
   route-death handling.
 - `src/transfer.rs` — the two ends of a file transfer: chunking, reassembly,
-  and the missing-chunk repair loop.
+  the missing-chunk repair loop, and the DHT rendezvous that lets a transfer
+  outlive the route it started on.
 - `src/main.rs` — CLI and Veilid node lifecycle.
 
 `cargo test` covers the encoding, the percentiles, the loss/reorder/duplicate

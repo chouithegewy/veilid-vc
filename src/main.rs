@@ -29,7 +29,7 @@ mod transfer;
 
 use clap::{Parser, Subcommand};
 use roles::{ProbeConfig, RouteParams, Stamped};
-use transfer::{RecvConfig, SendConfig};
+use transfer::{RecvConfig, RouteSource, SendConfig};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use veilid_core::*;
@@ -103,9 +103,15 @@ enum Command {
     },
     /// Push files at a receiver over its private route.
     Send {
-        /// Base64 route blob printed by the receiver.
+        /// Base64 route blob printed by the receiver. Names one route, so the
+        /// run ends if that route dies. Prefer --rendezvous.
+        #[arg(long, conflicts_with = "rendezvous", required_unless_present = "rendezvous")]
+        connect: Option<String>,
+
+        /// DHT record key printed by the receiver. The receiver rewrites it on
+        /// every route rotation, so a dead route is re-read rather than fatal.
         #[arg(long)]
-        connect: String,
+        rendezvous: Option<String>,
 
         /// Files to send, in order.
         #[arg(required = true)]
@@ -228,11 +234,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             roles::probe(api.clone(), update_rx, params, cfg, blob, done_rx).await
         }
         Command::Recv { out, max_bytes } => {
-            let cfg = RecvConfig { out_dir: out, max_bytes };
+            let cfg = RecvConfig {
+                out_dir: out,
+                max_bytes,
+                rendezvous_file: state_dir().join(".veilid/recv/rendezvous"),
+            };
             transfer::recv(api.clone(), update_rx, params, cfg, done_rx).await
         }
-        Command::Send { connect, files, chunk, rate, settle_ms, rounds } => {
-            let blob = decode_blob(&connect)?;
+        Command::Send { connect, rendezvous, files, chunk, rate, settle_ms, rounds } => {
+            let source = match (connect, rendezvous) {
+                (_, Some(key)) => RouteSource::Rendezvous(key),
+                (Some(blob), None) => RouteSource::Blob(decode_blob(&blob)?),
+                (None, None) => return Err("need --connect or --rendezvous".into()),
+            };
             let cfg = SendConfig {
                 files,
                 chunk,
@@ -240,12 +254,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 settle_ms,
                 max_rounds: rounds,
             };
-            transfer::send(api.clone(), update_rx, params, cfg, blob, done_rx).await
+            transfer::send(api.clone(), update_rx, params, cfg, source, done_rx).await
         }
     };
 
     api.shutdown().await;
     result
+}
+
+/// Where per-namespace state lives: beside the executable, like the veilid
+/// stores below.
+fn state_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_owned()))
+        .unwrap_or_else(|| ".".into())
 }
 
 fn decode_blob(connect: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -255,10 +278,7 @@ fn decode_blob(connect: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 fn config(namespace: &str) -> Result<VeilidConfig, Box<dyn std::error::Error>> {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_owned()))
-        .unwrap_or_else(|| ".".into());
+    let dir = state_dir();
 
     Ok(VeilidConfig {
         program_name: "veilid-vc".into(),

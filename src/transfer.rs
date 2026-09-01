@@ -37,6 +37,7 @@ use crate::proto::{
 use crate::roles::{create_route, routing_context, try_again_loop, RouteParams, Stamped, Updates};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -53,6 +54,75 @@ pub struct RecvConfig {
     /// allocates the whole file up front, and anyone holding the blob can open
     /// a transfer.
     pub max_bytes: u64,
+    /// Where the rendezvous record's key and owner keypair are kept, so the
+    /// same DHT key survives restarts and only has to be shared once.
+    pub rendezvous_file: PathBuf,
+}
+
+/// Where the sender gets the receiver's route from.
+pub enum RouteSource {
+    /// A blob pasted on the command line. Perishable: it names one route, and
+    /// when that route dies there is no way to learn its replacement.
+    Blob(Vec<u8>),
+    /// A DHT record the receiver rewrites on every rotation. The key is stable,
+    /// so a dead route becomes a re-read rather than the end of the run.
+    Rendezvous(String),
+}
+
+/// The receiver's side of the rendezvous: a DHT record whose subkey 0 always
+/// holds the blob for its current route.
+///
+/// A route blob names exactly one route, and routes die on their own schedule.
+/// Publishing the blob into a DHT record under a stable key breaks that
+/// coupling: the key is what you share, and the receiver rewrites the value
+/// behind it every time it rebuilds. `veilid-core` gives us the pieces
+/// (`create_dht_record`, `set_dht_value`, `get_dht_value`); the rendezvous
+/// itself is application-level, because Veilid has no session that outlives a
+/// route.
+struct Rendezvous {
+    rc: RoutingContext,
+    key: RecordKey,
+}
+
+impl Rendezvous {
+    /// Reuse the saved record if there is one, so the key stays constant across
+    /// restarts; otherwise mint a new one and remember its owner keypair.
+    async fn open(
+        rc: &RoutingContext,
+        path: &Path,
+    ) -> Result<Rendezvous, Box<dyn std::error::Error>> {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            let mut lines = txt.lines();
+            if let (Some(k), Some(kp)) = (lines.next(), lines.next())
+                && let (Ok(key), Ok(keypair)) = (RecordKey::from_str(k), KeyPair::from_str(kp))
+            {
+                match rc.open_dht_record(key.clone(), Some(keypair)).await {
+                    Ok(_) => return Ok(Rendezvous { rc: rc.clone(), key }),
+                    // Not fatal: mint a fresh record below and overwrite the
+                    // saved one. The old key simply stops being answered.
+                    Err(e) => eprintln!("could not reopen the saved rendezvous record: {e}"),
+                }
+            }
+        }
+        let desc = rc
+            .create_dht_record(VALID_CRYPTO_KINDS[0], DHTSchema::dflt(1)?, None)
+            .await?;
+        let key = desc.key();
+        if let Some(kp) = desc.owner_keypair() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(path, format!("{key}\n{kp}\n")) {
+                eprintln!("could not save the rendezvous key ({e}); it will change on restart");
+            }
+        }
+        Ok(Rendezvous { rc: rc.clone(), key })
+    }
+
+    async fn publish(&self, blob: &[u8]) -> VeilidAPIResult<()> {
+        self.rc.set_dht_value(self.key.clone(), 0, blob.to_vec(), None).await?;
+        Ok(())
+    }
 }
 
 pub struct SendConfig {
@@ -162,14 +232,42 @@ pub async fn recv(
     std::fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("{}: {e}", cfg.out_dir.display()))?;
 
-    let RouteBlob { route_id, blob } =
+    let rc = routing_context(&api, &params)?;
+
+    let RouteBlob { mut route_id, blob } =
         try_again_loop("creating route", || async { create_route(&api, &params).await }).await?;
+
+    // Publish the blob under a stable DHT key so a dead route is recoverable.
+    // Failing to do so is not fatal -- the printed blob still works for a
+    // single route's lifetime -- so the run continues without it.
+    let rendezvous = match Rendezvous::open(&rc, &cfg.rendezvous_file).await {
+        Ok(r) => match r.publish(&blob).await {
+            Ok(()) => Some(r),
+            Err(e) => {
+                eprintln!("could not publish the route to the rendezvous record: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("no rendezvous record ({e}); routes will not be recoverable");
+            None
+        }
+    };
 
     println!("Route ready: {route_id}\n");
     println!("Writing arrivals to {}\n", cfg.out_dir.display());
-    println!("Send files to it with:\n");
+    match &rendezvous {
+        Some(r) => {
+            println!("Send files to it with:\n");
+            println!("  veilid-vc send --rendezvous {} <file>...\n", r.key);
+            println!("That key is stable: it survives route death and restarts, so it only");
+            println!("has to be shared once. The one-shot equivalent, good until this route");
+            println!("dies, is:\n");
+        }
+        None => println!("Send files to it with:\n"),
+    }
     println!(
-        "  cargo run --release -- send --connect {} <file>...\n",
+        "  veilid-vc send --connect {} <file>...\n",
         data_encoding::BASE64.encode(&blob)
     );
     println!("Waiting. Ctrl-C to stop.\n");
@@ -214,11 +312,37 @@ pub async fn recv(
                     }
                     VeilidUpdate::RouteChange(change) => {
                         if change.dead_routes.contains(&route_id) {
-                            println!(
-                                "\nOur route died. Any blob already handed out is stale; \
-                                 restart to publish a fresh one."
-                            );
-                            break;
+                            // With a rendezvous record this is survivable: build
+                            // a new route, rewrite the record, and keep serving.
+                            // Transfers in flight are keyed by transfer id, not
+                            // by route, so they resume rather than restart.
+                            let Some(r) = &rendezvous else {
+                                println!(
+                                    "\nOur route died and there is no rendezvous record, so the \
+                                     blob already handed out is stale. Restart to publish a fresh one."
+                                );
+                                break;
+                            };
+                            println!("\nOur route died; rebuilding and republishing.");
+                            let _ = api.release_private_route(route_id.clone());
+                            match create_route(&api, &params).await {
+                                Ok(RouteBlob { route_id: fresh, blob }) => {
+                                    route_id = fresh;
+                                    match r.publish(&blob).await {
+                                        Ok(()) => println!(
+                                            "Republished as {route_id}; senders will pick it up."
+                                        ),
+                                        Err(e) => {
+                                            println!("could not republish the route: {e}");
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("could not rebuild our route: {e}");
+                                    break;
+                                }
+                            }
                         }
                     }
                     VeilidUpdate::Shutdown => break,
@@ -409,36 +533,108 @@ pub async fn send(
     mut updates: Updates,
     params: RouteParams,
     cfg: SendConfig,
-    remote_blob: Vec<u8>,
+    source: RouteSource,
     mut done: mpsc::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rc = routing_context(&api, &params)?;
 
-    let remote = try_again_loop("importing remote route", || async {
-        api.import_remote_private_route(remote_blob.clone())
-    })
-    .await?;
+    // With a rendezvous key the record stays open for the whole run, so a
+    // later re-read costs one DHT fetch rather than a fresh open.
+    let record = match &source {
+        RouteSource::Blob(_) => None,
+        RouteSource::Rendezvous(k) => {
+            let key = RecordKey::from_str(k)
+                .map_err(|e| format!("that does not look like a rendezvous key: {e}"))?;
+            let _ = try_again_loop("opening rendezvous record", || async {
+                rc.open_dht_record(key.clone(), None).await
+            })
+            .await?;
+            println!("Rendezvous: {key}");
+            Some(key)
+        }
+    };
 
+    let mut remote = import_route(&api, &rc, &source, record.as_ref()).await?;
     println!("Remote route: {remote}");
     println!("{}\n", params.describe());
 
-    let transfer = async {
-        for path in &cfg.files {
-            send_one(&rc, &remote, path, &cfg).await?;
-        }
-        Ok::<(), Box<dyn std::error::Error>>(())
-    };
-
-    tokio::select! {
-        r = transfer => r,
-        () = watch_remote(&mut updates, &remote) => {
-            Err("the remote route died mid-transfer; the receiver has to publish a fresh blob".into())
-        }
-        _ = done.recv() => {
-            println!("\nInterrupted.");
-            Ok(())
+    for path in &cfg.files {
+        // The transfer id is fixed per file rather than per attempt, so if the
+        // route dies and we come back on a new one the receiver recognises the
+        // transfer and we resume from the chunks it is missing.
+        let name = file_name_of(path);
+        let xfer = xfer_id(&name);
+        loop {
+            let outcome = tokio::select! {
+                r = send_one(&rc, &remote, path, &cfg, xfer) => {
+                    r?;
+                    Outcome::Done
+                }
+                () = watch_remote(&mut updates, &remote) => Outcome::RemoteRouteDied,
+                _ = done.recv() => {
+                    println!("\nInterrupted.");
+                    return Ok(());
+                }
+            };
+            match outcome {
+                Outcome::Done => break,
+                Outcome::RemoteRouteDied if record.is_some() => {
+                    println!("  the remote route died; re-reading the rendezvous record");
+                    remote = import_route(&api, &rc, &source, record.as_ref()).await?;
+                    println!("  resuming on {remote}");
+                }
+                Outcome::RemoteRouteDied => {
+                    return Err("the remote route died mid-transfer and there is no rendezvous \
+                                record, so there is no way to learn its replacement. Restart the \
+                                receiver for a fresh blob, or use --rendezvous."
+                        .into());
+                }
+            }
         }
     }
+    Ok(())
+}
+
+enum Outcome {
+    Done,
+    RemoteRouteDied,
+}
+
+/// Resolve the receiver's current route: straight from the pasted blob, or from
+/// the rendezvous record.
+///
+/// The DHT read always forces a refresh. A cached value is by definition the
+/// route we were told about last time, and the only reason to consult the
+/// record at all is that it may since have changed -- reading the cache would
+/// hand back exactly the stale blob we are trying to get away from.
+async fn import_route(
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    source: &RouteSource,
+    record: Option<&RecordKey>,
+) -> Result<RouteId, Box<dyn std::error::Error>> {
+    let blob = match (source, record) {
+        (RouteSource::Blob(b), _) => b.clone(),
+        (RouteSource::Rendezvous(_), Some(key)) => {
+            let value = try_again_loop("reading rendezvous record", || async {
+                rc.get_dht_value(key.clone(), 0, true).await
+            })
+            .await?
+            .ok_or("the rendezvous record exists but has no route published in it yet")?;
+            value.data().to_vec()
+        }
+        (RouteSource::Rendezvous(_), None) => return Err("rendezvous record was never opened".into()),
+    };
+    Ok(try_again_loop("importing remote route", || async {
+        api.import_remote_private_route(blob.clone())
+    })
+    .await?)
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "transfer.bin".to_string())
 }
 
 /// Returns when the route we are sending down is gone, or the node is stopping.
@@ -459,12 +655,10 @@ async fn send_one(
     remote: &RouteId,
     path: &Path,
     cfg: &SendConfig,
+    xfer: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "transfer.bin".to_string());
+    let name = file_name_of(path);
 
     let chunk_size = cfg.chunk.clamp(1, MAX_CHUNK_DATA);
     let chunk_count = bytes.len().div_ceil(chunk_size);
@@ -472,7 +666,6 @@ async fn send_one(
         return Err(format!("{name}: too many chunks; use a larger --chunk").into());
     }
     let crc = crc32(&bytes);
-    let xfer = xfer_id(&name);
 
     println!(
         "\n{name}: {} bytes, {chunk_count} chunk(s) of {chunk_size}, crc32 {crc:08x}",
@@ -769,7 +962,7 @@ mod tests {
     #[test]
     fn the_manifest_and_the_chunking_have_to_agree() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
         let ask = |total_len: u64, chunk_size: u32, chunk_count: u32| {
             Packet::Manifest {
                 xfer: 1,
@@ -803,7 +996,7 @@ mod tests {
     #[test]
     fn an_unknown_transfer_says_so_rather_than_lying_about_progress() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
         let reply = answer(&mut transfers, &HashSet::new(), &cfg, &Packet::Status { xfer: 7 }.encode(0)).unwrap();
         match Packet::decode(&reply) {
             Some(Packet::StatusReply { state, .. }) => assert_eq!(state, XFER_UNKNOWN),
@@ -814,7 +1007,7 @@ mod tests {
     #[test]
     fn a_retried_manifest_keeps_the_progress_already_made() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -827,7 +1020,7 @@ mod tests {
     #[test]
     fn status_records_the_first_pass_loss_once() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -861,7 +1054,7 @@ mod tests {
         let mut transfers = HashMap::new();
         let mut completed = HashSet::new();
         completed.insert(1u64);
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
         let reply =
             answer(&mut transfers, &completed, &cfg, &Packet::Status { xfer: 1 }.encode(0)).unwrap();
         match Packet::decode(&reply) {
