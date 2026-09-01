@@ -103,7 +103,15 @@ a local decision — try the next one — with no round trip and no dependence o
 the receiver being reachable at that instant. Only when every published route
 has failed is a DHT re-read worth the latency.
 
-The escalation, cheapest first:
+Routes are also replaced **before** they fail. One is rotated out every
+`--rotate-secs / --pool` seconds, so no route lives much past `--rotate-secs`
+(default 600) and they stagger rather than ageing out together. The order is
+make-before-break: the replacement is built and published first, and the
+retired route is kept answering for a further 90 seconds, so a sender that read
+the record just before a rotation is never stranded. A 2 MB transfer across
+five rotations completed with no loss, no repair passes and no failover.
+
+The escalation when one dies anyway, cheapest first:
 
 1. **Spare from the pool.** Instant, local, cannot fail on its own.
 2. **Re-read the record.** One DHT fetch, for when the whole pool is stale.
@@ -157,6 +165,7 @@ path the question arrived on. Only the receiver has to publish a blob.
 | `--out <dir>` | `inbox` | *(recv)* Where completed files are written. Created if missing. |
 | `--max-bytes` | 268435456 | *(recv)* Refuse a transfer larger than this. The file is assembled in memory, and anyone holding the blob can open one. |
 | `--pool <n>` | 3 | *(recv)* How many routes to keep published at once. Spares let a sender fail over locally instead of going back to the DHT. Clamped to 1–8. |
+| `--rotate-secs` | 600 | *(recv)* Roughly how long any one route may live before being replaced ahead of failing. 0 disables rotation. |
 | `--chunk` | 16384 | *(send)* Payload bytes per chunk. Larger is fewer round trips; smaller survives a lossy path better. Capped at 32751, what one `app_message` holds after the header. |
 | `--rate` | 20 | *(send)* Chunks per second. `--rate` × `--chunk` is the offered throughput; the default asks for about 320 KiB/s. |
 | `--settle-ms` | 1500 | *(send)* How long to wait after a pass before asking what is missing. Wants to be a couple of round trips of the measured RTT. |

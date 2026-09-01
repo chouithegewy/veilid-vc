@@ -105,6 +105,11 @@ enum Command {
         /// sender fail over locally instead of going back to the DHT.
         #[arg(long, default_value_t = 3)]
         pool: usize,
+
+        /// Roughly how many seconds any one route may live before it is
+        /// replaced ahead of failing. 0 disables rotation.
+        #[arg(long, default_value_t = 600)]
+        rotate_secs: u64,
     },
     /// Push files at a receiver over its private route.
     Send {
@@ -238,12 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             roles::probe(api.clone(), update_rx, params, cfg, blob, done_rx).await
         }
-        Command::Recv { out, max_bytes, pool } => {
+        Command::Recv { out, max_bytes, pool, rotate_secs } => {
             let cfg = RecvConfig {
                 out_dir: out,
                 max_bytes,
                 rendezvous_file: state_dir().join(".veilid/recv/rendezvous"),
                 pool: pool.clamp(1, 8),
+                rotate_secs,
             };
             transfer::recv(api.clone(), update_rx, params, cfg, done_rx).await
         }

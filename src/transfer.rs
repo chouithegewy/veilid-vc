@@ -54,6 +54,13 @@ const MAX_INFLIGHT: usize = 32;
 /// hands back the same dead routes.
 const MAX_POOL_REFRESHES: u32 = 3;
 
+/// How long a rotated-out route is kept alive after its replacement has been
+/// published. This is the "make" half of make-before-break: a sender that read
+/// the record just before the rotation still holds the old route, and dropping
+/// it immediately would strand exactly the sender the rotation was meant to
+/// protect.
+const ROTATION_GRACE: Duration = Duration::from_secs(90);
+
 pub struct RecvConfig {
     pub out_dir: PathBuf,
     /// Refuse any transfer claiming to be larger than this. The receiver
@@ -65,6 +72,9 @@ pub struct RecvConfig {
     pub rendezvous_file: PathBuf,
     /// How many private routes to keep published at once.
     pub pool: usize,
+    /// Roughly how long any one route is allowed to live before it is replaced.
+    /// Zero disables rotation, leaving the pool purely reactive.
+    pub rotate_secs: u64,
 }
 
 /// Where the sender gets the receiver's route from.
@@ -139,8 +149,16 @@ impl Rendezvous {
 /// The receiver's live routes. Every one of them reaches this node, so the pool
 /// is purely about how many ways in are published at once; nothing extra has to
 /// be done to serve them.
+struct Entry {
+    id: RouteId,
+    blob: Vec<u8>,
+    created: Instant,
+}
+
 struct Pool {
-    routes: Vec<(RouteId, Vec<u8>)>,
+    routes: Vec<Entry>,
+    /// Routes replaced by rotation, kept alive until their grace expires.
+    retiring: Vec<(RouteId, Instant)>,
     want: usize,
 }
 
@@ -155,25 +173,66 @@ impl Pool {
         // best-effort, because a smaller pool still works.
         let first = try_again_loop("creating route", || async { create_route(api, params).await })
             .await?;
-        routes.push((first.route_id, first.blob));
+        routes.push(Entry { id: first.route_id, blob: first.blob, created: Instant::now() });
         for _ in 1..want.max(1) {
             match create_route(api, params).await {
-                Ok(RouteBlob { route_id, blob }) => routes.push((route_id, blob)),
+                Ok(RouteBlob { route_id, blob }) => {
+                    routes.push(Entry { id: route_id, blob, created: Instant::now() })
+                }
                 Err(e) => {
                     eprintln!("could only build {} of {want} routes: {e}", routes.len());
                     break;
                 }
             }
         }
-        Ok(Pool { routes, want: want.max(1) })
+        Ok(Pool { routes, retiring: Vec::new(), want: want.max(1) })
     }
 
     fn blobs(&self) -> Vec<Vec<u8>> {
-        self.routes.iter().map(|(_, b)| b.clone()).collect()
+        self.routes.iter().map(|e| e.blob.clone()).collect()
     }
 
     fn holds(&self, id: &RouteId) -> bool {
-        self.routes.iter().any(|(r, _)| r == id)
+        self.routes.iter().any(|e| &e.id == id)
+    }
+
+    fn oldest_age(&self) -> Duration {
+        self.routes.iter().map(|e| e.created.elapsed()).max().unwrap_or_default()
+    }
+
+    /// Build a replacement, then stand the oldest route down. In that order:
+    /// the new route is published before the old one stops being answered, so
+    /// there is never a moment with fewer live routes than advertised.
+    async fn rotate(&mut self, api: &VeilidAPI, params: &RouteParams) -> Option<(RouteId, RouteId)> {
+        let RouteBlob { route_id, blob } = match create_route(api, params).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("rotation could not build a replacement route: {e}");
+                return None;
+            }
+        };
+        self.routes.push(Entry { id: route_id.clone(), blob, created: Instant::now() });
+        // Oldest first, so age is bounded rather than arbitrary.
+        let oldest = self
+            .routes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.created)
+            .map(|(i, _)| i)?;
+        let retired = self.routes.remove(oldest);
+        self.retiring.push((retired.id.clone(), Instant::now()));
+        Some((retired.id, route_id))
+    }
+
+    /// Release routes whose grace period has run out.
+    fn reap(&mut self, api: &VeilidAPI) {
+        self.retiring.retain(|(id, since)| {
+            if since.elapsed() < ROTATION_GRACE {
+                return true;
+            }
+            let _ = api.release_private_route(id.clone());
+            false
+        });
     }
 
     /// Drop the routes that just died and build replacements. Returns how many
@@ -185,14 +244,17 @@ impl Pool {
         dead: &[RouteId],
     ) -> usize {
         let before = self.routes.len();
-        self.routes.retain(|(id, _)| !dead.contains(id));
+        self.routes.retain(|e| !dead.contains(&e.id));
         let lost = before - self.routes.len();
+        self.retiring.retain(|(id, _)| !dead.contains(id));
         for id in dead {
             let _ = api.release_private_route(id.clone());
         }
         while self.routes.len() < self.want {
             match create_route(api, params).await {
-                Ok(RouteBlob { route_id, blob }) => self.routes.push((route_id, blob)),
+                Ok(RouteBlob { route_id, blob }) => {
+                    self.routes.push(Entry { id: route_id, blob, created: Instant::now() })
+                }
                 Err(e) => {
                     eprintln!("could not top the route pool back up: {e}");
                     break;
@@ -333,8 +395,8 @@ pub async fn recv(
 
     let blob = pool.blobs().into_iter().next().unwrap_or_default();
     println!("Routes ready ({}):", pool.routes.len());
-    for (id, _) in &pool.routes {
-        println!("  {id}");
+    for e in &pool.routes {
+        println!("  {}", e.id);
     }
     println!();
     println!("Writing arrivals to {}\n", cfg.out_dir.display());
@@ -362,6 +424,26 @@ pub async fn recv(
     let mut completed: HashSet<u64> = HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.tick().await;
+
+    // One route is replaced every rotate_secs/pool, so each lives about
+    // rotate_secs and the replacements stagger themselves out over time
+    // instead of the whole pool ageing out together.
+    let rotate_every = if cfg.rotate_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs((cfg.rotate_secs / cfg.pool.max(1) as u64).max(30)))
+    };
+    let mut rotate_tick = tokio::time::interval(
+        rotate_every.unwrap_or(Duration::from_secs(3600)),
+    );
+    rotate_tick.tick().await;
+    if let Some(d) = rotate_every {
+        println!(
+            "Rotating one route every {}s, so none lives much past {}s.\n",
+            d.as_secs(),
+            cfg.rotate_secs
+        );
+    }
 
     loop {
         tokio::select! {
@@ -426,6 +508,23 @@ pub async fn recv(
                     }
                     VeilidUpdate::Shutdown => break,
                     _ => {}
+                }
+            }
+            _ = rotate_tick.tick(), if rotate_every.is_some() => {
+                pool.reap(&api);
+                if let Some((retired, fresh)) = pool.rotate(&api, &params).await {
+                    match &rendezvous {
+                        Some(r) => match r.publish(&pool.blobs()).await {
+                            Ok(()) => println!(
+                                "Rotated {retired} out for {fresh} (oldest route now {}s).",
+                                pool.oldest_age().as_secs()
+                            ),
+                            Err(e) => println!("rotated but could not republish: {e}"),
+                        },
+                        // Without a record nobody can learn the new route, so
+                        // rotating would only throw away the one they have.
+                        None => println!("no rendezvous record; skipping rotation"),
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -1131,7 +1230,7 @@ mod tests {
     #[test]
     fn the_manifest_and_the_chunking_have_to_agree() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1, rotate_secs: 0 };
         let ask = |total_len: u64, chunk_size: u32, chunk_count: u32| {
             Packet::Manifest {
                 xfer: 1,
@@ -1165,7 +1264,7 @@ mod tests {
     #[test]
     fn an_unknown_transfer_says_so_rather_than_lying_about_progress() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1, rotate_secs: 0 };
         let reply = answer(&mut transfers, &HashSet::new(), &cfg, &Packet::Status { xfer: 7 }.encode(0)).unwrap();
         match Packet::decode(&reply) {
             Some(Packet::StatusReply { state, .. }) => assert_eq!(state, XFER_UNKNOWN),
@@ -1176,7 +1275,7 @@ mod tests {
     #[test]
     fn a_retried_manifest_keeps_the_progress_already_made() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1, rotate_secs: 0 };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -1189,7 +1288,7 @@ mod tests {
     #[test]
     fn status_records_the_first_pass_loss_once() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1, rotate_secs: 0 };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -1223,7 +1322,7 @@ mod tests {
         let mut transfers = HashMap::new();
         let mut completed = HashSet::new();
         completed.insert(1u64);
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1, rotate_secs: 0 };
         let reply =
             answer(&mut transfers, &completed, &cfg, &Packet::Status { xfer: 1 }.encode(0)).unwrap();
         match Packet::decode(&reply) {
