@@ -1,0 +1,893 @@
+//! Moving whole files over a private route.
+//!
+//! The measurement side of this tool answers "how fast is the path?". This
+//! answers the next question: can you actually get a file across it, and what
+//! does the path cost you while you do?
+//!
+//! Veilid gives you two primitives and neither is a file transfer. `app_message`
+//! is fire-and-forget and capped at 32,768 bytes, so a file is a pile of chunks
+//! and some of them will not arrive. `app_call` is request/response, so it is
+//! reliable, but it pays a full round trip per call and the whole point of a
+//! private route is that the round trip is long.
+//!
+//! So this uses both, for what each is good at:
+//!
+//! 1. **Manifest** over `app_call`. The sender does not send a byte until the
+//!    receiver has acknowledged the name, the length, the chunking and the
+//!    CRC-32 of the file. One round trip, and afterwards both ends agree on
+//!    what "complete" means.
+//! 2. **Chunks** over `app_message`, paced, many in flight. This is the part
+//!    that has to be fast, and it is the part that loses packets.
+//! 3. **Status** over `app_call`. "What are you still missing?" The receiver
+//!    answers with the indices it has not got. The sender resends exactly
+//!    those and asks again.
+//!
+//! Step 3 repeats until the answer is "nothing", so the transfer is reliable
+//! without an ack per chunk, and the size of the first answer is a direct
+//! measurement of what `app_message` loss looks like at this chunk size.
+//!
+//! The receiver never needs a route back to the sender: an `app_call` answer
+//! returns down the path the question arrived on, so the sender can always be
+//! heard even though it never published a route of its own.
+
+use crate::proto::{
+    crc32, Packet, MAX_CHUNK_DATA, MAX_MISSING_LISTED, XFER_COMPLETE, XFER_IN_PROGRESS,
+    XFER_UNKNOWN,
+};
+use crate::roles::{create_route, routing_context, try_again_loop, RouteParams, Stamped, Updates};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use veilid_core::*;
+
+/// How many chunk sends may be in the node at once. Past this the pacing loop
+/// waits, so a stalled network applies backpressure instead of growing a pile
+/// of tasks.
+const MAX_INFLIGHT: usize = 32;
+
+pub struct RecvConfig {
+    pub out_dir: PathBuf,
+    /// Refuse any transfer claiming to be larger than this. The receiver
+    /// allocates the whole file up front, and anyone holding the blob can open
+    /// a transfer.
+    pub max_bytes: u64,
+}
+
+pub struct SendConfig {
+    pub files: Vec<PathBuf>,
+    pub chunk: usize,
+    pub rate: u64,
+    pub settle_ms: u64,
+    pub max_rounds: u32,
+}
+
+// ---------------------------------------------------------------------------
+// receiver
+// ---------------------------------------------------------------------------
+
+/// A transfer in progress: the file being assembled and what is still missing.
+struct Incoming {
+    name: String,
+    total_len: u64,
+    chunk_size: u32,
+    chunk_count: u32,
+    crc: u32,
+    data: Vec<u8>,
+    have: Vec<bool>,
+    have_count: u32,
+    started: Instant,
+    duplicates: u32,
+    /// How many chunks were still missing the first time the sender asked.
+    /// That is what the first pass actually lost, before any repair.
+    first_pass_missing: Option<u32>,
+    repair_rounds: u32,
+}
+
+impl Incoming {
+    fn new(name: String, total_len: u64, chunk_size: u32, chunk_count: u32, crc: u32) -> Self {
+        Self {
+            name,
+            total_len,
+            chunk_size,
+            chunk_count,
+            crc,
+            data: vec![0u8; total_len as usize],
+            have: vec![false; chunk_count as usize],
+            have_count: 0,
+            started: Instant::now(),
+            duplicates: 0,
+            first_pass_missing: None,
+            repair_rounds: 0,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.have_count == self.chunk_count
+    }
+
+    /// Where chunk `index` belongs, or None if it is not a chunk of this file.
+    fn span(&self, index: u32) -> Option<(usize, usize)> {
+        if index >= self.chunk_count {
+            return None;
+        }
+        let start = index as u64 * self.chunk_size as u64;
+        let end = (start + self.chunk_size as u64).min(self.total_len);
+        Some((start as usize, end as usize))
+    }
+
+    /// Returns true if this chunk was new. A chunk whose length disagrees with
+    /// the manifest is dropped: the sender promised a shape and this is not it.
+    fn store(&mut self, index: u32, data: &[u8]) -> bool {
+        let Some((start, end)) = self.span(index) else {
+            return false;
+        };
+        if data.len() != end - start {
+            return false;
+        }
+        if self.have[index as usize] {
+            self.duplicates += 1;
+            return false;
+        }
+        self.data[start..end].copy_from_slice(data);
+        self.have[index as usize] = true;
+        self.have_count += 1;
+        true
+    }
+
+    /// The chunks still wanted: the honest total, and as many indices as one
+    /// answer can name.
+    fn missing(&self) -> (u32, Vec<u32>) {
+        let total = self.chunk_count - self.have_count;
+        let listed = self
+            .have
+            .iter()
+            .enumerate()
+            .filter(|(_, got)| !**got)
+            .map(|(i, _)| i as u32)
+            .take(MAX_MISSING_LISTED)
+            .collect();
+        (total, listed)
+    }
+}
+
+pub async fn recv(
+    api: VeilidAPI,
+    mut updates: Updates,
+    params: RouteParams,
+    cfg: RecvConfig,
+    mut done: mpsc::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&cfg.out_dir)
+        .map_err(|e| format!("{}: {e}", cfg.out_dir.display()))?;
+
+    let RouteBlob { route_id, blob } =
+        try_again_loop("creating route", || async { create_route(&api, &params).await }).await?;
+
+    println!("Route ready: {route_id}\n");
+    println!("Writing arrivals to {}\n", cfg.out_dir.display());
+    println!("Send files to it with:\n");
+    println!(
+        "  cargo run --release -- send --connect {} <file>...\n",
+        data_encoding::BASE64.encode(&blob)
+    );
+    println!("Waiting. Ctrl-C to stop.\n");
+
+    let mut transfers: HashMap<u64, Incoming> = HashMap::new();
+    // Transfer ids that are already written out. A `complete` answer can be
+    // lost like anything else, and the sender will ask again; without this the
+    // second question answers "never heard of it" and it sends the whole file
+    // a second time.
+    let mut completed: HashSet<u64> = HashSet::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            Some(Stamped { update, .. }) = updates.recv() => {
+                match update {
+                    // Control traffic. The answer goes back down the route the
+                    // question came in on, so no return route is needed.
+                    VeilidUpdate::AppCall(call) => {
+                        let Some(reply) = answer(&mut transfers, &completed, &cfg, call.message())
+                        else {
+                            // Not ours. Leaving it unanswered lets the caller's
+                            // own timeout deal with it.
+                            continue;
+                        };
+                        if let Err(e) = api.app_call_reply(call.id(), reply).await {
+                            eprintln!("could not answer a call: {e}");
+                        }
+                        // Answering a status query is the moment a transfer can
+                        // turn out to be finished, because the last chunk may
+                        // have landed while we were idle.
+                        finish_completed(&cfg, &mut transfers, &mut completed);
+                    }
+                    VeilidUpdate::AppMessage(msg) => {
+                        if let Some(Packet::Chunk { xfer, index, data }) =
+                            Packet::decode(msg.message())
+                            && let Some(inc) = transfers.get_mut(&xfer)
+                        {
+                            inc.store(index, &data);
+                        }
+                    }
+                    VeilidUpdate::RouteChange(change) => {
+                        if change.dead_routes.contains(&route_id) {
+                            println!(
+                                "\nOur route died. Any blob already handed out is stale; \
+                                 restart to publish a fresh one."
+                            );
+                            break;
+                        }
+                    }
+                    VeilidUpdate::Shutdown => break,
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => {
+                for inc in transfers.values() {
+                    println!(
+                        "  {} — {}/{} chunks ({:.0}%)",
+                        inc.name,
+                        inc.have_count,
+                        inc.chunk_count,
+                        inc.have_count as f64 * 100.0 / inc.chunk_count.max(1) as f64,
+                    );
+                }
+            }
+            _ = done.recv() => break,
+        }
+    }
+
+    if !transfers.is_empty() {
+        println!("\n{} transfer(s) unfinished:", transfers.len());
+        for inc in transfers.values() {
+            println!("  {} — {}/{} chunks", inc.name, inc.have_count, inc.chunk_count);
+        }
+    }
+    Ok(())
+}
+
+/// Build the answer to one `app_call`, or None if it was not for us.
+fn answer(
+    transfers: &mut HashMap<u64, Incoming>,
+    completed: &HashSet<u64>,
+    cfg: &RecvConfig,
+    message: &[u8],
+) -> Option<Vec<u8>> {
+    match Packet::decode(message)? {
+        Packet::Manifest { xfer, total_len, chunk_size, chunk_count, crc32: crc, name } => {
+            let refuse = |why: &str| {
+                Some(Packet::ManifestOk { xfer, accepted: false, message: why.into() }.encode(0))
+            };
+            if completed.contains(&xfer) {
+                // Already written. Accepting costs the sender one wasted pass,
+                // which the next status query cuts short; refusing would look
+                // like a failure for a file that arrived intact.
+                return Some(Packet::ManifestOk { xfer, accepted: true, message: String::new() }.encode(0));
+            }
+            if let Some(existing) = transfers.get(&xfer) {
+                // A retried manifest, because our first answer did not make it
+                // back. Keep the progress we already have.
+                println!("Resuming {} ({}/{} chunks)", existing.name, existing.have_count, existing.chunk_count);
+                return Some(Packet::ManifestOk { xfer, accepted: true, message: String::new() }.encode(0));
+            }
+            if total_len > cfg.max_bytes {
+                println!("Refused {name}: {total_len} bytes is over the --max-bytes limit");
+                return refuse("over the receiver's --max-bytes limit");
+            }
+            if chunk_size == 0 || chunk_size as usize > MAX_CHUNK_DATA {
+                return refuse("chunk size will not fit an app_message");
+            }
+            // The three numbers have to agree, or `span` and the manifest are
+            // describing different files.
+            if total_len.div_ceil(chunk_size as u64) != chunk_count as u64 {
+                return refuse("chunk count does not match the length and chunk size");
+            }
+            println!(
+                "Incoming: {name} — {total_len} bytes, {chunk_count} chunk(s) of {chunk_size}, crc32 {crc:08x}"
+            );
+            transfers.insert(xfer, Incoming::new(name, total_len, chunk_size, chunk_count, crc));
+            Some(Packet::ManifestOk { xfer, accepted: true, message: String::new() }.encode(0))
+        }
+        Packet::Status { xfer } => {
+            let Some(inc) = transfers.get_mut(&xfer) else {
+                let state = if completed.contains(&xfer) { XFER_COMPLETE } else { XFER_UNKNOWN };
+                return Some(
+                    Packet::StatusReply { xfer, state, missing_total: 0, missing: Vec::new() }
+                        .encode(0),
+                );
+            };
+            let (missing_total, missing) = inc.missing();
+            if inc.first_pass_missing.is_none() {
+                inc.first_pass_missing = Some(missing_total);
+            } else {
+                inc.repair_rounds += 1;
+            }
+            let state = if inc.complete() { XFER_COMPLETE } else { XFER_IN_PROGRESS };
+            Some(Packet::StatusReply { xfer, state, missing_total, missing }.encode(0))
+        }
+        _ => None,
+    }
+}
+
+/// Write out and report every transfer that has all of its chunks.
+fn finish_completed(
+    cfg: &RecvConfig,
+    transfers: &mut HashMap<u64, Incoming>,
+    completed: &mut HashSet<u64>,
+) {
+    let done: Vec<u64> = transfers
+        .iter()
+        .filter(|(_, inc)| inc.complete())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in done {
+        if let Some(inc) = transfers.remove(&id) {
+            write_out(cfg, inc);
+            completed.insert(id);
+        }
+    }
+}
+
+fn write_out(cfg: &RecvConfig, inc: Incoming) {
+    let elapsed = inc.started.elapsed().as_secs_f64().max(0.001);
+    let got = crc32(&inc.data);
+    let path = unique_path(&cfg.out_dir, &safe_name(&inc.name));
+
+    println!("\n-- received {} --", inc.name);
+    match std::fs::write(&path, &inc.data) {
+        Ok(()) => println!("  written to             {}", path.display()),
+        Err(e) => println!("  COULD NOT WRITE        {}: {e}", path.display()),
+    }
+    println!("  bytes                  {}", inc.total_len);
+    println!(
+        "  elapsed                {elapsed:.1}s  ({:.1} KiB/s)",
+        inc.total_len as f64 / elapsed / 1024.0
+    );
+    println!("  chunks                 {} of {}", inc.chunk_count, inc.chunk_size);
+    if let Some(missed) = inc.first_pass_missing {
+        println!(
+            "  lost on the first pass {missed}  ({:.1}% of chunks)",
+            missed as f64 * 100.0 / inc.chunk_count.max(1) as f64
+        );
+    }
+    println!("  repair rounds          {}", inc.repair_rounds);
+    println!("  duplicate chunks       {}", inc.duplicates);
+    if got == inc.crc {
+        println!("  crc32                  {got:08x}  matches the sender");
+    } else {
+        println!("  crc32                  {got:08x}  DOES NOT MATCH sender's {:08x}", inc.crc);
+    }
+    println!();
+}
+
+/// Reduce a name from the wire to something that can only land inside the
+/// output directory. The sender is whoever holds the blob, so this treats the
+/// name as hostile: directory components are dropped, and so is anything that
+/// could make the result start with a dot.
+fn safe_name(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\u{7f}')
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim();
+    if cleaned.is_empty() {
+        "transfer.bin".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Never overwrite. A second `cat.png` lands as `cat-1.png`.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..10_000 {
+        let candidate = dir.join(format!("{stem}-{n}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}-{}{ext}", crate::proto::now_us()))
+}
+
+// ---------------------------------------------------------------------------
+// sender
+// ---------------------------------------------------------------------------
+
+pub async fn send(
+    api: VeilidAPI,
+    mut updates: Updates,
+    params: RouteParams,
+    cfg: SendConfig,
+    remote_blob: Vec<u8>,
+    mut done: mpsc::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rc = routing_context(&api, &params)?;
+
+    let remote = try_again_loop("importing remote route", || async {
+        api.import_remote_private_route(remote_blob.clone())
+    })
+    .await?;
+
+    println!("Remote route: {remote}");
+    println!("{}\n", params.describe());
+
+    let transfer = async {
+        for path in &cfg.files {
+            send_one(&rc, &remote, path, &cfg).await?;
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    tokio::select! {
+        r = transfer => r,
+        () = watch_remote(&mut updates, &remote) => {
+            Err("the remote route died mid-transfer; the receiver has to publish a fresh blob".into())
+        }
+        _ = done.recv() => {
+            println!("\nInterrupted.");
+            Ok(())
+        }
+    }
+}
+
+/// Returns when the route we are sending down is gone, or the node is stopping.
+async fn watch_remote(updates: &mut Updates, remote: &RouteId) {
+    while let Some(Stamped { update, .. }) = updates.recv().await {
+        match update {
+            VeilidUpdate::RouteChange(change) if change.dead_remote_routes.contains(remote) => {
+                return
+            }
+            VeilidUpdate::Shutdown => return,
+            _ => {}
+        }
+    }
+}
+
+async fn send_one(
+    rc: &RoutingContext,
+    remote: &RouteId,
+    path: &Path,
+    cfg: &SendConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "transfer.bin".to_string());
+
+    let chunk_size = cfg.chunk.clamp(1, MAX_CHUNK_DATA);
+    let chunk_count = bytes.len().div_ceil(chunk_size);
+    if chunk_count > u32::MAX as usize {
+        return Err(format!("{name}: too many chunks; use a larger --chunk").into());
+    }
+    let crc = crc32(&bytes);
+    let xfer = xfer_id(&name);
+
+    println!(
+        "\n{name}: {} bytes, {chunk_count} chunk(s) of {chunk_size}, crc32 {crc:08x}",
+        bytes.len()
+    );
+
+    let manifest = Packet::Manifest {
+        xfer,
+        total_len: bytes.len() as u64,
+        chunk_size: chunk_size as u32,
+        chunk_count: chunk_count as u32,
+        crc32: crc,
+        name: name.clone(),
+    }
+    .encode(0);
+
+    open_transfer(rc, remote, &manifest, &name).await?;
+
+    let started = Instant::now();
+    let mut pending: Vec<u32> = (0..chunk_count as u32).collect();
+    let mut chunk_sends = 0u64;
+    let mut send_errors = 0u64;
+    let mut first_pass_missing = None;
+    let mut round = 0u32;
+
+    loop {
+        if !pending.is_empty() {
+            if round == 0 {
+                println!("  sending {} chunk(s) at {}/s", pending.len(), cfg.rate);
+            } else {
+                println!("  repair pass {round}: resending {} chunk(s)", pending.len());
+            }
+            let (ok, failed) =
+                blast(rc, remote, xfer, &bytes, chunk_size, &pending, cfg.rate).await;
+            chunk_sends += ok + failed;
+            send_errors += failed;
+        }
+
+        // Let whatever is still in flight land before calling it missing.
+        tokio::time::sleep(Duration::from_millis(cfg.settle_ms)).await;
+
+        let reply = call(rc, remote, Packet::Status { xfer }.encode(0), "status").await?;
+        let Some(Packet::StatusReply { state, missing_total, missing, .. }) = Packet::decode(&reply)
+        else {
+            return Err(format!("{name}: the receiver answered a status query with something else").into());
+        };
+        if first_pass_missing.is_none() {
+            first_pass_missing = Some(missing_total);
+        }
+
+        match state {
+            XFER_COMPLETE => break,
+            XFER_UNKNOWN => {
+                // The receiver restarted, or never got the manifest at all.
+                println!("  the receiver does not know this transfer; opening it again");
+                open_transfer(rc, remote, &manifest, &name).await?;
+                pending = (0..chunk_count as u32).collect();
+            }
+            _ => {
+                if missing.is_empty() {
+                    return Err(format!(
+                        "{name}: the receiver is {missing_total} chunk(s) short but named none of them"
+                    )
+                    .into());
+                }
+                pending = missing;
+            }
+        }
+
+        round += 1;
+        if round > cfg.max_rounds {
+            return Err(format!(
+                "{name}: still {missing_total} chunk(s) short after {} repair pass(es); \
+                 try a lower --rate or a smaller --chunk",
+                cfg.max_rounds
+            )
+            .into());
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let lost = first_pass_missing.unwrap_or(0);
+    println!("  delivered in {elapsed:.1}s  ({:.1} KiB/s)", bytes.len() as f64 / elapsed / 1024.0);
+    println!(
+        "  {chunk_sends} chunk send(s) for {chunk_count} chunk(s); first pass lost {lost} \
+         ({:.1}%), {round} repair pass(es)",
+        lost as f64 * 100.0 / chunk_count.max(1) as f64
+    );
+    if send_errors > 0 {
+        println!("  {send_errors} chunk(s) never left the node");
+    }
+    Ok(())
+}
+
+/// Get the receiver to agree to a transfer before sending any of it.
+async fn open_transfer(
+    rc: &RoutingContext,
+    remote: &RouteId,
+    manifest: &[u8],
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reply = call(rc, remote, manifest.to_vec(), "manifest").await?;
+    match Packet::decode(&reply) {
+        Some(Packet::ManifestOk { accepted: true, .. }) => Ok(()),
+        Some(Packet::ManifestOk { message, .. }) => {
+            Err(format!("{name}: the receiver refused it — {message}").into())
+        }
+        _ => Err(format!("{name}: the receiver answered the manifest with something else").into()),
+    }
+}
+
+/// One `app_call`, retried past the failures that are worth retrying.
+///
+/// Two kinds of "not yet" are worth telling apart. `TryAgain` is the node
+/// still finding its feet — a freshly started sender has not established its
+/// network class yet and cannot allocate a route at all, which is normal for
+/// the first several seconds and not a failure. That gets waited out. A
+/// timeout or a dropped route is a real miss, and gets a bounded number of
+/// attempts with a growing pause.
+async fn call(
+    rc: &RoutingContext,
+    remote: &RouteId,
+    message: Vec<u8>,
+    what: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    const ATTEMPTS: u32 = 5;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let sent = try_again_loop(what, || async {
+            rc.app_call(Target::RouteId(remote.clone()), message.clone()).await
+        })
+        .await;
+        match sent {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                last = e.to_string();
+                eprintln!("  {what} attempt {attempt}/{ATTEMPTS} failed: {e}");
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+        }
+    }
+    Err(format!("{what} failed after {ATTEMPTS} attempts: {last}").into())
+}
+
+/// Push the named chunks at the receiver, paced, several in flight. Returns
+/// (accepted by the node, refused by the node).
+async fn blast(
+    rc: &RoutingContext,
+    remote: &RouteId,
+    xfer: u64,
+    bytes: &[u8],
+    chunk_size: usize,
+    indices: &[u32],
+    rate: u64,
+) -> (u64, u64) {
+    let mut ticker = tokio::time::interval(Duration::from_micros(1_000_000 / rate.max(1)));
+    // Waiting for in-flight room must not be repaid as a burst at full speed;
+    // --rate is a spacing, not an average to catch up to.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut set: JoinSet<bool> = JoinSet::new();
+    let (mut ok, mut failed) = (0u64, 0u64);
+    let mut tally = |sent: bool| {
+        if sent {
+            ok += 1;
+        } else {
+            failed += 1;
+        }
+    };
+
+    for &i in indices {
+        ticker.tick().await;
+        while set.len() >= MAX_INFLIGHT {
+            match set.join_next().await {
+                Some(Ok(sent)) => tally(sent),
+                Some(Err(_)) => tally(false),
+                None => break,
+            }
+        }
+        let start = i as usize * chunk_size;
+        let end = (start + chunk_size).min(bytes.len());
+        let payload = Packet::Chunk { xfer, index: i, data: bytes[start..end].to_vec() }.encode(0);
+        let rc = rc.clone();
+        let target = remote.clone();
+        set.spawn(async move {
+            rc.app_message(Target::RouteId(target), payload).await.is_ok()
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        tally(matches!(r, Ok(true)));
+    }
+    (ok, failed)
+}
+
+/// A per-transfer id, so two runs against the same receiver never collide and
+/// a restarted sender does not resume into a stale half-file.
+fn xfer_id(name: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ crate::proto::now_us().rotate_left(17)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incoming(total_len: u64, chunk_size: u32) -> Incoming {
+        let count = total_len.div_ceil(chunk_size as u64) as u32;
+        Incoming::new("x.bin".into(), total_len, chunk_size, count, 0)
+    }
+
+    #[test]
+    fn a_file_reassembles_out_of_order() {
+        let mut inc = incoming(2500, 1000);
+        assert_eq!(inc.chunk_count, 3);
+        assert!(inc.store(2, &[3u8; 500])); // the short last chunk
+        assert!(inc.store(0, &[1u8; 1000]));
+        assert!(!inc.complete());
+        assert!(inc.store(1, &[2u8; 1000]));
+        assert!(inc.complete());
+        assert_eq!(inc.data[0], 1);
+        assert_eq!(inc.data[1000], 2);
+        assert_eq!(inc.data[2000], 3);
+    }
+
+    #[test]
+    fn a_chunk_of_the_wrong_length_is_dropped() {
+        let mut inc = incoming(2500, 1000);
+        // The last chunk is 500 bytes; a full-size one there would run past
+        // the end of the file.
+        assert!(!inc.store(2, &[9u8; 1000]));
+        assert!(!inc.store(0, &[9u8; 999]));
+        assert_eq!(inc.have_count, 0);
+    }
+
+    #[test]
+    fn a_chunk_past_the_end_is_dropped() {
+        let mut inc = incoming(2500, 1000);
+        assert!(!inc.store(3, &[9u8; 1000]));
+        assert!(!inc.store(u32::MAX, &[9u8; 1000]));
+        assert_eq!(inc.have_count, 0);
+    }
+
+    #[test]
+    fn duplicates_are_counted_not_stored_twice() {
+        let mut inc = incoming(2000, 1000);
+        assert!(inc.store(0, &[1u8; 1000]));
+        assert!(!inc.store(0, &[2u8; 1000]));
+        assert_eq!(inc.duplicates, 1);
+        assert_eq!(inc.have_count, 1);
+        assert_eq!(inc.data[0], 1, "the duplicate must not overwrite what arrived first");
+    }
+
+    #[test]
+    fn missing_names_the_gaps() {
+        let mut inc = incoming(5000, 1000);
+        inc.store(0, &[0u8; 1000]);
+        inc.store(2, &[0u8; 1000]);
+        inc.store(4, &[0u8; 1000]);
+        assert_eq!(inc.missing(), (2, vec![1, 3]));
+    }
+
+    #[test]
+    fn missing_lists_no_more_than_one_answer_holds() {
+        let count = MAX_MISSING_LISTED as u64 + 100;
+        let inc = incoming(count, 1);
+        let (total, listed) = inc.missing();
+        assert_eq!(total as u64, count);
+        assert_eq!(listed.len(), MAX_MISSING_LISTED);
+    }
+
+    #[test]
+    fn an_empty_file_is_complete_on_arrival() {
+        let inc = Incoming::new("empty".into(), 0, 1000, 0, crc32(b""));
+        assert!(inc.complete());
+        assert_eq!(inc.missing(), (0, vec![]));
+    }
+
+    #[test]
+    fn a_hostile_name_cannot_escape_the_output_directory() {
+        assert_eq!(safe_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_name("/etc/shadow"), "shadow");
+        assert_eq!(safe_name(r"..\..\windows\system32\cmd.exe"), "cmd.exe");
+        assert_eq!(safe_name(".."), "transfer.bin");
+        assert_eq!(safe_name(""), "transfer.bin");
+        assert_eq!(safe_name("   "), "transfer.bin");
+        assert_eq!(safe_name(".bashrc"), "bashrc");
+        assert_eq!(safe_name("ok\u{0}nul.png"), "oknul.png");
+        assert_eq!(safe_name("cat.png"), "cat.png");
+    }
+
+    #[test]
+    fn the_manifest_and_the_chunking_have_to_agree() {
+        let mut transfers = HashMap::new();
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let ask = |total_len: u64, chunk_size: u32, chunk_count: u32| {
+            Packet::Manifest {
+                xfer: 1,
+                total_len,
+                chunk_size,
+                chunk_count,
+                crc32: 0,
+                name: "x".into(),
+            }
+            .encode(0)
+        };
+        let accepted = |msg: &[u8], transfers: &mut HashMap<u64, Incoming>| {
+            match Packet::decode(&answer(transfers, &HashSet::new(), &cfg, msg).unwrap()) {
+                Some(Packet::ManifestOk { accepted, .. }) => accepted,
+                other => panic!("answered with {other:?}"),
+            }
+        };
+
+        // 100 bytes in 10-byte chunks is 10 chunks, not 9.
+        assert!(!accepted(&ask(100, 10, 9), &mut transfers));
+        // Over --max-bytes.
+        assert!(!accepted(&ask(2048, 10, 205), &mut transfers));
+        // A chunk that could never fit one app_message.
+        assert!(!accepted(&ask(100, u32::MAX, 1), &mut transfers));
+        assert!(transfers.is_empty());
+        // And the one that adds up.
+        assert!(accepted(&ask(100, 10, 10), &mut transfers));
+        assert_eq!(transfers.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_transfer_says_so_rather_than_lying_about_progress() {
+        let mut transfers = HashMap::new();
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let reply = answer(&mut transfers, &HashSet::new(), &cfg, &Packet::Status { xfer: 7 }.encode(0)).unwrap();
+        match Packet::decode(&reply) {
+            Some(Packet::StatusReply { state, .. }) => assert_eq!(state, XFER_UNKNOWN),
+            other => panic!("answered with {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retried_manifest_keeps_the_progress_already_made() {
+        let mut transfers = HashMap::new();
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let manifest =
+            Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
+                .encode(0);
+        answer(&mut transfers, &HashSet::new(), &cfg, &manifest).unwrap();
+        transfers.get_mut(&1).unwrap().store(0, &[1u8; 10]);
+        answer(&mut transfers, &HashSet::new(), &cfg, &manifest).unwrap();
+        assert_eq!(transfers.get(&1).unwrap().have_count, 1);
+    }
+
+    #[test]
+    fn status_records_the_first_pass_loss_once() {
+        let mut transfers = HashMap::new();
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let manifest =
+            Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
+                .encode(0);
+        answer(&mut transfers, &HashSet::new(), &cfg, &manifest).unwrap();
+        for i in 0..8 {
+            transfers.get_mut(&1).unwrap().store(i, &[0u8; 10]);
+        }
+        let status = Packet::Status { xfer: 1 }.encode(0);
+        answer(&mut transfers, &HashSet::new(), &cfg, &status).unwrap();
+        // Two more arrive, and the sender asks again.
+        transfers.get_mut(&1).unwrap().store(8, &[0u8; 10]);
+        transfers.get_mut(&1).unwrap().store(9, &[0u8; 10]);
+        let reply = answer(&mut transfers, &HashSet::new(), &cfg, &status).unwrap();
+        match Packet::decode(&reply) {
+            Some(Packet::StatusReply { state, missing_total, .. }) => {
+                assert_eq!(state, XFER_COMPLETE);
+                assert_eq!(missing_total, 0);
+            }
+            other => panic!("answered with {other:?}"),
+        }
+        let inc = transfers.get(&1).unwrap();
+        assert_eq!(inc.first_pass_missing, Some(2), "the first answer is what the first pass lost");
+        assert_eq!(inc.repair_rounds, 1);
+    }
+
+    #[test]
+    fn a_finished_transfer_is_not_forgotten_the_moment_it_is_written() {
+        // The sender's status call can time out after we have answered it. It
+        // asks again; if that answer were "never heard of it" the sender would
+        // send the whole file a second time.
+        let mut transfers = HashMap::new();
+        let mut completed = HashSet::new();
+        completed.insert(1u64);
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024 };
+        let reply =
+            answer(&mut transfers, &completed, &cfg, &Packet::Status { xfer: 1 }.encode(0)).unwrap();
+        match Packet::decode(&reply) {
+            Some(Packet::StatusReply { state, missing_total, .. }) => {
+                assert_eq!(state, XFER_COMPLETE);
+                assert_eq!(missing_total, 0);
+            }
+            other => panic!("answered with {other:?}"),
+        }
+        // And a re-opened manifest for it does not start the file again.
+        let manifest = Packet::Manifest {
+            xfer: 1,
+            total_len: 100,
+            chunk_size: 10,
+            chunk_count: 10,
+            crc32: 0,
+            name: "x".into(),
+        }
+        .encode(0);
+        answer(&mut transfers, &completed, &cfg, &manifest).unwrap();
+        assert!(transfers.is_empty());
+    }
+
+    #[test]
+    fn xfer_ids_differ_between_runs_of_the_same_file() {
+        assert_ne!(xfer_id("cat.png"), xfer_id("cat.png"));
+        assert_ne!(xfer_id("cat.png"), xfer_id("dog.png"));
+    }
+}

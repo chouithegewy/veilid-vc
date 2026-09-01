@@ -1,0 +1,13 @@
+[package]
+name = "veilid-vc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+ctrlc = "3.5.2"
+data-encoding = "2.11.1"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing-subscriber = "0.3.23"
+veilid-core = { version = "0.5.7", features = ["footgun-nodeid-target"] }
+

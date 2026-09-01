@@ -1,0 +1,285 @@
+//! veilid-vc — a latency harness for Veilid's `app_message`.
+//!
+//! Before designing a call protocol on top of Veilid it is worth knowing what
+//! the transport actually does under a media-shaped load: 50 small packets a
+//! second, sustained, through a private route. Nobody has published those
+//! numbers. This measures them.
+//!
+//!   Terminal one:   cargo run --release -- listen
+//!   Terminal two:   cargo run --release -- probe --connect <blob>
+//!
+//! The same route machinery moves files, which is the other thing you want to
+//! know before building on this transport:
+//!
+//!   Terminal one:   cargo run --release -- recv --out ./inbox
+//!   Terminal two:   cargo run --release -- send --connect <blob> photo.jpg
+//!
+//! Run it against a private dev network first (see the veilid repo's
+//! dev-setup/dev-network-setup.md); the public network is a moving target and
+//! you want a baseline you control.
+
+// veilid-core's async call stack nests deeply enough that auto-trait resolution
+// runs past the default limit when we spawn an `app_message` future.
+#![recursion_limit = "256"]
+
+mod proto;
+mod roles;
+mod stats;
+mod transfer;
+
+use clap::{Parser, Subcommand};
+use roles::{ProbeConfig, RouteParams, Stamped};
+use transfer::{RecvConfig, SendConfig};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use veilid_core::*;
+
+#[derive(Parser)]
+#[command(version, about = "Measure what Veilid does to a media-shaped packet stream")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// Logging verbosity: -d info, -dd debug, -ddd trace
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    debug: u8,
+
+    /// Private route hop count. Lower is faster and less private; omit to use
+    /// the node default.
+    #[arg(long, global = true)]
+    hops: Option<usize>,
+
+    /// Prefer a low-latency route over a long-lived one.
+    #[arg(long, global = true, default_value = "low-latency")]
+    stability: StabilityArg,
+
+    /// Ordering preference. Media wants unordered — a late packet is worthless.
+    #[arg(long, global = true, default_value = "prefer-unordered")]
+    sequencing: SequencingArg,
+
+    /// Drop the safety route. Lowest latency Veilid can offer, at the cost of
+    /// revealing this node to the far end.
+    #[arg(long = "unsafe", global = true)]
+    unsafe_routing: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a private route, print its blob, and echo back whatever arrives.
+    Listen,
+    /// Send timestamped packets at a listener and report what came back.
+    Probe {
+        /// Base64 route blob printed by the listener.
+        #[arg(long)]
+        connect: String,
+
+        /// Packets per second. 50 matches 20 ms Opus frames.
+        #[arg(long, default_value_t = 50)]
+        rate: u64,
+
+        /// Total bytes per packet, padded. Clamped to Veilid's 32768 cap.
+        /// 60-ish is a real Opus voice frame; 1200 is a video packet.
+        #[arg(long, default_value_t = 64)]
+        size: usize,
+
+        /// Seconds to run. 0 runs until Ctrl-C.
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+
+        /// Write one row per echoed packet here for later analysis.
+        #[arg(long)]
+        csv: Option<std::path::PathBuf>,
+    },
+    /// Create a private route, print its blob, and write whatever files arrive.
+    Recv {
+        /// Directory for completed files. Created if it does not exist.
+        #[arg(long, default_value = "inbox")]
+        out: std::path::PathBuf,
+
+        /// Refuse any single transfer larger than this. The whole file is held
+        /// in memory, and anyone holding the blob can open a transfer.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+    /// Push files at a receiver over its private route.
+    Send {
+        /// Base64 route blob printed by the receiver.
+        #[arg(long)]
+        connect: String,
+
+        /// Files to send, in order.
+        #[arg(required = true)]
+        files: Vec<std::path::PathBuf>,
+
+        /// Payload bytes per chunk. Bigger is fewer round trips; smaller
+        /// survives a lossy path better. Clamped to what one app_message holds.
+        #[arg(long, default_value_t = 16384)]
+        chunk: usize,
+
+        /// Chunks per second. This times --chunk is the offered throughput.
+        #[arg(long, default_value_t = 20)]
+        rate: u64,
+
+        /// How long to wait after a pass before asking what is missing.
+        /// Wants to be a couple of round trips.
+        #[arg(long, default_value_t = 1500)]
+        settle_ms: u64,
+
+        /// Give up after this many repair passes.
+        #[arg(long, default_value_t = 20)]
+        rounds: u32,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StabilityArg {
+    LowLatency,
+    Reliable,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SequencingArg {
+    PreferUnordered,
+    PreferOrdered,
+    EnsureOrdered,
+}
+
+impl From<StabilityArg> for Stability {
+    fn from(a: StabilityArg) -> Self {
+        match a {
+            StabilityArg::LowLatency => Stability::LowLatency,
+            StabilityArg::Reliable => Stability::Reliable,
+        }
+    }
+}
+
+impl From<SequencingArg> for Sequencing {
+    fn from(a: SequencingArg) -> Self {
+        match a {
+            SequencingArg::PreferUnordered => Sequencing::PreferUnordered,
+            SequencingArg::PreferOrdered => Sequencing::PreferOrdered,
+            SequencingArg::EnsureOrdered => Sequencing::EnsureOrdered,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    let (done_tx, done_rx) = mpsc::channel(1);
+    ctrlc::set_handler(move || {
+        let _ = done_tx.try_send(());
+    })?;
+
+    let logs = VeilidTracing::stderr();
+    logs.try_apply_default_env()?;
+    logs.try_apply_facility_level(
+        "#common",
+        match cli.debug {
+            1 => VeilidConfigLogLevel::Info,
+            2 => VeilidConfigLogLevel::Debug,
+            3.. => VeilidConfigLogLevel::Trace,
+            _ => VeilidConfigLogLevel::Warn,
+        },
+    )?;
+
+    let params = RouteParams {
+        hops: cli.hops,
+        stability: cli.stability.into(),
+        sequencing: cli.sequencing.into(),
+        unsafe_routing: cli.unsafe_routing,
+    };
+
+    // The two roles get separate namespaces so both can run on one machine
+    // against the same state directory without fighting over it.
+    let namespace = match &cli.command {
+        Command::Listen => "listen",
+        Command::Probe { .. } => "probe",
+        Command::Recv { .. } => "recv",
+        Command::Send { .. } => "send",
+    };
+
+    // Updates arrive on a callback with no async context, so stamp each one on
+    // arrival and hand it to the role over a channel. Log updates are dropped
+    // here rather than forwarded — at trace level they would swamp the queue
+    // the measurements travel on.
+    let (update_tx, update_rx) = mpsc::unbounded_channel::<Stamped>();
+    let callback = move |update: VeilidUpdate| {
+        if matches!(update, VeilidUpdate::Log(_)) {
+            return;
+        }
+        let _ = update_tx.send(Stamped { at_us: proto::now_us(), update });
+    };
+
+    let api = Box::pin(api_startup(Arc::new(callback), config(namespace)?)).await?;
+    api.attach().await?;
+
+    let result = match cli.command {
+        Command::Listen => roles::listen(api.clone(), update_rx, params, done_rx).await,
+        Command::Probe { connect, rate, size, duration, csv } => {
+            let blob = decode_blob(&connect)?;
+            let cfg = ProbeConfig {
+                rate: rate.max(1),
+                size: roles::clamp_size(size),
+                duration_secs: duration,
+                csv,
+            };
+            roles::probe(api.clone(), update_rx, params, cfg, blob, done_rx).await
+        }
+        Command::Recv { out, max_bytes } => {
+            let cfg = RecvConfig { out_dir: out, max_bytes };
+            transfer::recv(api.clone(), update_rx, params, cfg, done_rx).await
+        }
+        Command::Send { connect, files, chunk, rate, settle_ms, rounds } => {
+            let blob = decode_blob(&connect)?;
+            let cfg = SendConfig {
+                files,
+                chunk,
+                rate: rate.max(1),
+                settle_ms,
+                max_rounds: rounds,
+            };
+            transfer::send(api.clone(), update_rx, params, cfg, blob, done_rx).await
+        }
+    };
+
+    api.shutdown().await;
+    result
+}
+
+fn decode_blob(connect: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    data_encoding::BASE64
+        .decode(connect.trim().as_bytes())
+        .map_err(|e| format!("that does not look like a route blob: {e}").into())
+}
+
+fn config(namespace: &str) -> Result<VeilidConfig, Box<dyn std::error::Error>> {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_owned()))
+        .unwrap_or_else(|| ".".into());
+
+    Ok(VeilidConfig {
+        program_name: "veilid-vc".into(),
+        namespace: namespace.to_owned(),
+        protected_store: VeilidConfigProtectedStore {
+            // Fine for a measurement tool that holds nothing worth protecting.
+            // Do not carry this into anything that stores a real identity.
+            always_use_insecure_storage: true,
+            directory: dir
+                .join(format!(".veilid/{namespace}/protected_store"))
+                .to_string_lossy()
+                .to_string(),
+            ..Default::default()
+        },
+        table_store: VeilidConfigTableStore {
+            directory: dir
+                .join(format!(".veilid/{namespace}/table_store"))
+                .to_string_lossy()
+                .to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
