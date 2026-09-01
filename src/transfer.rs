@@ -59,7 +59,13 @@ const MAX_POOL_REFRESHES: u32 = 3;
 /// the record just before the rotation still holds the old route, and dropping
 /// it immediately would strand exactly the sender the rotation was meant to
 /// protect.
-const ROTATION_GRACE: Duration = Duration::from_secs(90);
+const ROTATION_GRACE: Duration = Duration::from_secs(300);
+
+/// A route that has carried a message this recently is doing its job. Rotating
+/// it would break whoever is mid-transfer on it, which is the one thing
+/// rotation must never do -- age is not a reason to replace a route that
+/// demonstrably works.
+const HOT_WINDOW: Duration = Duration::from_secs(60);
 
 pub struct RecvConfig {
     pub out_dir: PathBuf,
@@ -149,10 +155,32 @@ impl Rendezvous {
 /// The receiver's live routes. Every one of them reaches this node, so the pool
 /// is purely about how many ways in are published at once; nothing extra has to
 /// be done to serve them.
+/// Whether a route counts as in use, given when it last carried a message.
+/// Split out from `Entry` so the policy can be tested without conjuring a
+/// `RouteId`.
+fn carrying_traffic(last_seen: Option<Instant>) -> bool {
+    last_seen.is_some_and(|t| t.elapsed() < HOT_WINDOW)
+}
+
 struct Entry {
     id: RouteId,
     blob: Vec<u8>,
     created: Instant,
+    /// When a message last arrived over this route. `None` means it has never
+    /// carried anything, which is normal for a spare.
+    last_seen: Option<Instant>,
+    messages: u64,
+}
+
+impl Entry {
+    fn new(id: RouteId, blob: Vec<u8>) -> Entry {
+        Entry { id, blob, created: Instant::now(), last_seen: None, messages: 0 }
+    }
+
+    /// Carrying traffic right now, so off-limits to rotation.
+    fn is_hot(&self) -> bool {
+        carrying_traffic(self.last_seen)
+    }
 }
 
 struct Pool {
@@ -173,12 +201,10 @@ impl Pool {
         // best-effort, because a smaller pool still works.
         let first = try_again_loop("creating route", || async { create_route(api, params).await })
             .await?;
-        routes.push(Entry { id: first.route_id, blob: first.blob, created: Instant::now() });
+        routes.push(Entry::new(first.route_id, first.blob));
         for _ in 1..want.max(1) {
             match create_route(api, params).await {
-                Ok(RouteBlob { route_id, blob }) => {
-                    routes.push(Entry { id: route_id, blob, created: Instant::now() })
-                }
+                Ok(RouteBlob { route_id, blob }) => routes.push(Entry::new(route_id, blob)),
                 Err(e) => {
                     eprintln!("could only build {} of {want} routes: {e}", routes.len());
                     break;
@@ -200,10 +226,29 @@ impl Pool {
         self.routes.iter().map(|e| e.created.elapsed()).max().unwrap_or_default()
     }
 
+    /// Record that something arrived over this route. This is the only quality
+    /// signal available -- veilid exposes no per-route stats -- but it is the
+    /// one that matters: a route delivering messages is working.
+    fn note_traffic(&mut self, id: &RouteId) {
+        if let Some(e) = self.routes.iter_mut().find(|e| &e.id == id) {
+            e.last_seen = Some(Instant::now());
+            e.messages += 1;
+        }
+    }
+
+    fn hot_count(&self) -> usize {
+        self.routes.iter().filter(|e| e.is_hot()).count()
+    }
+
     /// Build a replacement, then stand the oldest route down. In that order:
     /// the new route is published before the old one stops being answered, so
     /// there is never a moment with fewer live routes than advertised.
     async fn rotate(&mut self, api: &VeilidAPI, params: &RouteParams) -> Option<(RouteId, RouteId)> {
+        // Nothing to do if every route is busy; the pool is being used exactly
+        // as intended and churning it would only cause harm.
+        if self.routes.iter().all(|e| e.is_hot()) {
+            return None;
+        }
         let RouteBlob { route_id, blob } = match create_route(api, params).await {
             Ok(r) => r,
             Err(e) => {
@@ -211,12 +256,15 @@ impl Pool {
                 return None;
             }
         };
-        self.routes.push(Entry { id: route_id.clone(), blob, created: Instant::now() });
-        // Oldest first, so age is bounded rather than arbitrary.
+        self.routes.push(Entry::new(route_id.clone(), blob));
+        // Oldest *idle* route. A route carrying traffic is left alone however
+        // old it is: replacing it would strand the transfer using it, and the
+        // sender's own failover already handles a route that genuinely breaks.
         let oldest = self
             .routes
             .iter()
             .enumerate()
+            .filter(|(_, e)| !e.is_hot() && e.id != route_id)
             .min_by_key(|(_, e)| e.created)
             .map(|(i, _)| i)?;
         let retired = self.routes.remove(oldest);
@@ -252,9 +300,7 @@ impl Pool {
         }
         while self.routes.len() < self.want {
             match create_route(api, params).await {
-                Ok(RouteBlob { route_id, blob }) => {
-                    self.routes.push(Entry { id: route_id, blob, created: Instant::now() })
-                }
+                Ok(RouteBlob { route_id, blob }) => self.routes.push(Entry::new(route_id, blob)),
                 Err(e) => {
                     eprintln!("could not top the route pool back up: {e}");
                     break;
@@ -452,6 +498,9 @@ pub async fn recv(
                     // Control traffic. The answer goes back down the route the
                     // question came in on, so no return route is needed.
                     VeilidUpdate::AppCall(call) => {
+                        if let Some(id) = call.route_id() {
+                            pool.note_traffic(id);
+                        }
                         let Some(reply) = answer(&mut transfers, &completed, &cfg, call.message())
                         else {
                             // Not ours. Leaving it unanswered lets the caller's
@@ -467,6 +516,9 @@ pub async fn recv(
                         finish_completed(&cfg, &mut transfers, &mut completed);
                     }
                     VeilidUpdate::AppMessage(msg) => {
+                        if let Some(id) = msg.route_id() {
+                            pool.note_traffic(id);
+                        }
                         if let Some(Packet::Chunk { xfer, index, data }) =
                             Packet::decode(msg.message())
                             && let Some(inc) = transfers.get_mut(&xfer)
@@ -512,11 +564,17 @@ pub async fn recv(
             }
             _ = rotate_tick.tick(), if rotate_every.is_some() => {
                 pool.reap(&api);
-                if let Some((retired, fresh)) = pool.rotate(&api, &params).await {
+                let busy = pool.hot_count();
+                if busy == pool.routes.len() && busy > 0 {
+                    println!("All {busy} route(s) carrying traffic; leaving them alone.");
+                } else if let Some((retired, fresh)) = pool.rotate(&api, &params).await {
                     match &rendezvous {
                         Some(r) => match r.publish(&pool.blobs()).await {
                             Ok(()) => println!(
-                                "Rotated {retired} out for {fresh} (oldest route now {}s).",
+                                "Rotated idle {retired} out for {fresh} ({} of {} route(s) busy, \
+                                 oldest now {}s).",
+                                busy,
+                                pool.routes.len(),
                                 pool.oldest_age().as_secs()
                             ),
                             Err(e) => println!("rotated but could not republish: {e}"),
@@ -1397,6 +1455,28 @@ mod tests {
         .encode(0);
         answer(&mut transfers, &completed, &cfg, &manifest).unwrap();
         assert!(transfers.is_empty());
+    }
+
+    #[test]
+    fn a_route_carrying_traffic_is_not_a_rotation_candidate() {
+        assert!(!carrying_traffic(None), "a route that never carried anything is idle");
+        assert!(carrying_traffic(Some(Instant::now())), "one that just delivered is in use");
+        assert!(
+            !carrying_traffic(Some(Instant::now() - HOT_WINDOW - Duration::from_secs(1))),
+            "traffic older than the window stops protecting it"
+        );
+        assert!(
+            carrying_traffic(Some(Instant::now() - HOT_WINDOW / 2)),
+            "traffic inside the window still protects it"
+        );
+    }
+
+    #[test]
+    fn the_grace_period_outlasts_the_hot_window() {
+        // A rotated-out route must stay alive longer than it takes for a
+        // sender to be considered idle, or the two rules disagree about
+        // whether it is safe to drop.
+        assert!(ROTATION_GRACE > HOT_WINDOW);
     }
 
     #[test]

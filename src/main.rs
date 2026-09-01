@@ -106,9 +106,11 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         pool: usize,
 
-        /// Roughly how many seconds any one route may live before it is
-        /// replaced ahead of failing. 0 disables rotation.
-        #[arg(long, default_value_t = 600)]
+        /// Roughly how many seconds an idle route may live before it is
+        /// replaced ahead of failing. Off by default: rotation churns the
+        /// spare routes that sender failover depends on, and measured worse
+        /// than leaving the pool alone. Kept for experimentation.
+        #[arg(long, default_value_t = 0)]
         rotate_secs: u64,
     },
     /// Push files at a receiver over its private route.
