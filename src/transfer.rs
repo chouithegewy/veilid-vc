@@ -747,10 +747,12 @@ pub async fn send(
         let name = file_name_of(path);
         let xfer = xfer_id(&name);
         let mut refreshes = 0u32;
+        let mut stats = FileStats::default();
+        let started = Instant::now();
         loop {
             let remote = routes[current].clone();
             let outcome = tokio::select! {
-                r = send_one(&rc, &remote, path, &cfg, xfer) => match r {
+                r = send_one(&rc, &remote, path, &cfg, xfer, &mut stats) => match r {
                     Ok(()) => Outcome::Done,
                     Err(SendError::RouteUnusable(why)) => {
                         println!("  {why}");
@@ -765,7 +767,10 @@ pub async fn send(
                 }
             };
             match outcome {
-                Outcome::Done => break,
+                Outcome::Done => {
+                    report_file(path, &stats, started);
+                    break;
+                }
                 Outcome::RemoteRouteDied => {
                     // A spare from the published pool costs nothing to try: we
                     // already hold it, so this is a local retry with no round
@@ -822,6 +827,21 @@ enum Outcome {
 /// with `could not get remote private route`. Treating that as fatal throws
 /// away perfectly good spares, so it is reported separately and retried on the
 /// next route.
+/// Per-file totals, accumulated across however many attempts and routes it
+/// took. Keeping these in the caller is the point: a retry after a failover is
+/// still the same file, and timing it from the retry's start reports a
+/// throughput that never happened.
+#[derive(Default)]
+struct FileStats {
+    chunk_sends: u64,
+    send_errors: u64,
+    repairs: u32,
+    first_pass_missing: Option<u32>,
+    attempts: u32,
+    total_chunks: u32,
+    bytes: u64,
+}
+
 enum SendError {
     RouteUnusable(String),
     Fatal(Box<dyn std::error::Error>),
@@ -909,6 +929,7 @@ async fn send_one(
     path: &Path,
     cfg: &SendConfig,
     xfer: u64,
+    stats: &mut FileStats,
 ) -> Result<(), SendError> {
     let bytes = std::fs::read(path)
         .map_err(|e| SendError::Fatal(format!("{}: {e}", path.display()).into()))?;
@@ -940,29 +961,15 @@ async fn send_one(
 
     open_transfer(rc, remote, &manifest, &name).await?;
 
-    let started = Instant::now();
-    let mut pending: Vec<u32> = (0..chunk_count as u32).collect();
-    let mut chunk_sends = 0u64;
-    let mut send_errors = 0u64;
-    let mut first_pass_missing = None;
+    stats.attempts += 1;
     let mut round = 0u32;
 
+    // Ask before sending, every time round. On a fresh transfer the answer is
+    // "all of them" and this costs one round trip; on a resumed one -- after a
+    // failover, or a second run of the same file -- it is what makes the resume
+    // real. Assuming a full send and letting the receiver discard duplicates
+    // gets the right file, but re-ships every byte already delivered.
     loop {
-        if !pending.is_empty() {
-            if round == 0 {
-                println!("  sending {} chunk(s) at {}/s", pending.len(), cfg.rate);
-            } else {
-                println!("  repair pass {round}: resending {} chunk(s)", pending.len());
-            }
-            let (ok, failed) =
-                blast(rc, remote, xfer, &bytes, chunk_size, &pending, cfg.rate).await;
-            chunk_sends += ok + failed;
-            send_errors += failed;
-        }
-
-        // Let whatever is still in flight land before calling it missing.
-        tokio::time::sleep(Duration::from_millis(cfg.settle_ms)).await;
-
         let reply = call(rc, remote, Packet::Status { xfer }.encode(0), "status")
             .await
             .map_err(|e| SendError::RouteUnusable(format!("status calls are failing ({e})")))?;
@@ -972,8 +979,10 @@ async fn send_one(
                 format!("{name}: the receiver answered a status query with something else").into(),
             ));
         };
-        if first_pass_missing.is_none() {
-            first_pass_missing = Some(missing_total);
+        // Round 0's answer is the starting position, not a loss measurement.
+        // The first pass's loss is what is still missing after it.
+        if round == 1 && stats.first_pass_missing.is_none() {
+            stats.first_pass_missing = Some(missing_total);
         }
 
         match state {
@@ -982,18 +991,42 @@ async fn send_one(
                 // The receiver restarted, or never got the manifest at all.
                 println!("  the receiver does not know this transfer; opening it again");
                 open_transfer(rc, remote, &manifest, &name).await?;
-                pending = (0..chunk_count as u32).collect();
-            }
-            _ => {
-                if missing.is_empty() {
+                round += 1;
+                if round > cfg.max_rounds {
                     return Err(SendError::Fatal(
-                        format!("{name}: the receiver is {missing_total} chunk(s) short but named none of them")
-                            .into(),
+                        format!("{name}: the receiver keeps forgetting this transfer").into(),
                     ));
                 }
-                pending = missing;
+                continue;
             }
+            _ => {}
         }
+
+        if missing.is_empty() {
+            return Err(SendError::Fatal(
+                format!("{name}: the receiver is {missing_total} chunk(s) short but named none of them")
+                    .into(),
+            ));
+        }
+
+        if round == 0 {
+            let already = chunk_count as u32 - missing_total;
+            if already > 0 {
+                println!("  resuming: {already} of {chunk_count} chunk(s) already there");
+            }
+            println!("  sending {} chunk(s) at {}/s", missing.len(), cfg.rate);
+        } else {
+            println!("  repair pass {round}: resending {} chunk(s)", missing.len());
+        }
+        let (ok, failed) = blast(rc, remote, xfer, &bytes, chunk_size, &missing, cfg.rate).await;
+        stats.chunk_sends += ok + failed;
+        stats.send_errors += failed;
+        if round > 0 {
+            stats.repairs += 1;
+        }
+
+        // Let whatever is still in flight land before calling it missing.
+        tokio::time::sleep(Duration::from_millis(cfg.settle_ms)).await;
 
         round += 1;
         if round > cfg.max_rounds {
@@ -1008,18 +1041,38 @@ async fn send_one(
         }
     }
 
-    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let lost = first_pass_missing.unwrap_or(0);
-    println!("  delivered in {elapsed:.1}s  ({:.1} KiB/s)", bytes.len() as f64 / elapsed / 1024.0);
-    println!(
-        "  {chunk_sends} chunk send(s) for {chunk_count} chunk(s); first pass lost {lost} \
-         ({:.1}%), {round} repair pass(es)",
-        lost as f64 * 100.0 / chunk_count.max(1) as f64
-    );
-    if send_errors > 0 {
-        println!("  {send_errors} chunk(s) never left the node");
-    }
+    stats.total_chunks = chunk_count as u32;
+    stats.bytes = bytes.len() as u64;
     Ok(())
+}
+
+/// The per-file summary, printed once the file is actually complete -- timed
+/// from when the file was first attempted, not from the attempt that happened
+/// to finish it.
+fn report_file(path: &Path, stats: &FileStats, started: Instant) {
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let lost = stats.first_pass_missing.unwrap_or(0);
+    println!(
+        "  delivered in {elapsed:.1}s  ({:.1} KiB/s)",
+        stats.bytes as f64 / elapsed / 1024.0
+    );
+    println!(
+        "  {} chunk send(s) for {} chunk(s); first pass lost {lost} ({:.1}%), {} repair pass(es)",
+        stats.chunk_sends,
+        stats.total_chunks,
+        lost as f64 * 100.0 / stats.total_chunks.max(1) as f64,
+        stats.repairs,
+    );
+    if stats.attempts > 1 {
+        println!(
+            "  took {} attempts across {} route(s)",
+            stats.attempts, stats.attempts
+        );
+    }
+    if stats.send_errors > 0 {
+        println!("  {} chunk(s) never left the node", stats.send_errors);
+    }
+    let _ = path;
 }
 
 /// Get the receiver to agree to a transfer before sending any of it.
