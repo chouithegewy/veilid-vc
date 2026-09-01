@@ -15,6 +15,43 @@ It also moves files across the same routes, because the second thing you want to
 know about a transport is whether a few hundred kilobytes survive it. See
 [Sending files](#sending-files).
 
+## Getting it onto a machine
+
+Each release carries a prebuilt `veilid-vc-x86_64-linux`. It is built inside an
+Ubuntu 20.04 container and needs **glibc 2.30 or newer** — Ubuntu 20.04+,
+Debian 11+, RHEL/Rocky 9, Amazon Linux 2023. It links nothing but libc, so
+there is no Rust toolchain and nothing to install on the far end: drop the file
+somewhere on `$PATH`, `chmod +x`, run it.
+
+Two platforms it will *not* run on: RHEL/CentOS 8 and its rebuilds (glibc 2.28,
+below the floor) and Alpine or anything else on musl. Both need a build from
+source.
+
+Check before you copy it anywhere:
+
+```
+ldd --version | head -1        # needs 2.30 or newer
+```
+
+The repository is private, so downloading a release asset needs a credential.
+Easiest is the GitHub CLI, once, on the target machine:
+
+```
+gh auth login
+gh release download -R chouithegewy/veilid-vc --pattern 'veilid-vc-x86_64-linux'
+chmod +x veilid-vc-x86_64-linux
+./veilid-vc-x86_64-linux --help
+```
+
+Or skip GitHub entirely and copy it from a machine that already has it:
+
+```
+scp veilid-vc-x86_64-linux user@vm:~/
+```
+
+Building from source needs Rust 1.85 or newer (the crate is edition 2024):
+`cargo build --release`.
+
 ## Running it
 
 Two terminals. The listener creates a private route and prints its blob:
