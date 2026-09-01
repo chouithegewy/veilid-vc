@@ -33,20 +33,19 @@ Check before you copy it anywhere:
 ldd --version | head -1        # needs 2.30 or newer
 ```
 
-The repository is private, so downloading a release asset needs a credential.
-Easiest is the GitHub CLI, once, on the target machine:
-
 ```
-gh auth login
-gh release download -R chouithegewy/veilid-vc --pattern 'veilid-vc-x86_64-linux'
-chmod +x veilid-vc-x86_64-linux
-./veilid-vc-x86_64-linux --help
+curl -fsSL -o veilid-vc https://github.com/chouithegewy/veilid-vc/releases/latest/download/veilid-vc-x86_64-linux
+chmod +x veilid-vc
+./veilid-vc --help
 ```
 
-Or skip GitHub entirely and copy it from a machine that already has it:
+That URL always points at the newest release. To pin a version, swap
+`latest/download` for `download/v0.1.0`. Each release also publishes a
+`.sha256` next to the binary:
 
 ```
-scp veilid-vc-x86_64-linux user@vm:~/
+curl -fsSL -O https://github.com/chouithegewy/veilid-vc/releases/latest/download/veilid-vc-x86_64-linux.sha256
+echo "$(cat veilid-vc-x86_64-linux.sha256)  veilid-vc" | sha256sum -c -
 ```
 
 Building from source needs Rust 1.85 or newer (the crate is edition 2024):
