@@ -100,6 +100,11 @@ enum Command {
         /// in memory, and anyone holding the blob can open a transfer.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_bytes: u64,
+
+        /// How many private routes to keep published at once. Spares let a
+        /// sender fail over locally instead of going back to the DHT.
+        #[arg(long, default_value_t = 3)]
+        pool: usize,
     },
     /// Push files at a receiver over its private route.
     Send {
@@ -233,11 +238,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             roles::probe(api.clone(), update_rx, params, cfg, blob, done_rx).await
         }
-        Command::Recv { out, max_bytes } => {
+        Command::Recv { out, max_bytes, pool } => {
             let cfg = RecvConfig {
                 out_dir: out,
                 max_bytes,
                 rendezvous_file: state_dir().join(".veilid/recv/rendezvous"),
+                pool: pool.clamp(1, 8),
             };
             transfer::recv(api.clone(), update_rx, params, cfg, done_rx).await
         }

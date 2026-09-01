@@ -48,6 +48,12 @@ use veilid_core::*;
 /// of tasks.
 const MAX_INFLIGHT: usize = 32;
 
+/// How many times to go back to the rendezvous record after burning through
+/// every route it named. Without a bound a permanently dead receiver spins
+/// forever: the record still holds its last, now-useless list, so each refresh
+/// hands back the same dead routes.
+const MAX_POOL_REFRESHES: u32 = 3;
+
 pub struct RecvConfig {
     pub out_dir: PathBuf,
     /// Refuse any transfer claiming to be larger than this. The receiver
@@ -57,6 +63,8 @@ pub struct RecvConfig {
     /// Where the rendezvous record's key and owner keypair are kept, so the
     /// same DHT key survives restarts and only has to be shared once.
     pub rendezvous_file: PathBuf,
+    /// How many private routes to keep published at once.
+    pub pool: usize,
 }
 
 /// Where the sender gets the receiver's route from.
@@ -119,9 +127,79 @@ impl Rendezvous {
         Ok(Rendezvous { rc: rc.clone(), key })
     }
 
-    async fn publish(&self, blob: &[u8]) -> VeilidAPIResult<()> {
-        self.rc.set_dht_value(self.key.clone(), 0, blob.to_vec(), None).await?;
+    /// Publish the whole pool, most-preferred first. A sender that holds the
+    /// list can fail over locally instead of coming back to the DHT.
+    async fn publish(&self, blobs: &[Vec<u8>]) -> VeilidAPIResult<()> {
+        let value = Packet::Routes { blobs: blobs.to_vec() }.encode(0);
+        self.rc.set_dht_value(self.key.clone(), 0, value, None).await?;
         Ok(())
+    }
+}
+
+/// The receiver's live routes. Every one of them reaches this node, so the pool
+/// is purely about how many ways in are published at once; nothing extra has to
+/// be done to serve them.
+struct Pool {
+    routes: Vec<(RouteId, Vec<u8>)>,
+    want: usize,
+}
+
+impl Pool {
+    async fn build(
+        api: &VeilidAPI,
+        params: &RouteParams,
+        want: usize,
+    ) -> Result<Pool, Box<dyn std::error::Error>> {
+        let mut routes = Vec::new();
+        // The first has to succeed or there is nothing to publish; the rest are
+        // best-effort, because a smaller pool still works.
+        let first = try_again_loop("creating route", || async { create_route(api, params).await })
+            .await?;
+        routes.push((first.route_id, first.blob));
+        for _ in 1..want.max(1) {
+            match create_route(api, params).await {
+                Ok(RouteBlob { route_id, blob }) => routes.push((route_id, blob)),
+                Err(e) => {
+                    eprintln!("could only build {} of {want} routes: {e}", routes.len());
+                    break;
+                }
+            }
+        }
+        Ok(Pool { routes, want: want.max(1) })
+    }
+
+    fn blobs(&self) -> Vec<Vec<u8>> {
+        self.routes.iter().map(|(_, b)| b.clone()).collect()
+    }
+
+    fn holds(&self, id: &RouteId) -> bool {
+        self.routes.iter().any(|(r, _)| r == id)
+    }
+
+    /// Drop the routes that just died and build replacements. Returns how many
+    /// were lost, so the caller can decide whether the record needs rewriting.
+    async fn replace_dead(
+        &mut self,
+        api: &VeilidAPI,
+        params: &RouteParams,
+        dead: &[RouteId],
+    ) -> usize {
+        let before = self.routes.len();
+        self.routes.retain(|(id, _)| !dead.contains(id));
+        let lost = before - self.routes.len();
+        for id in dead {
+            let _ = api.release_private_route(id.clone());
+        }
+        while self.routes.len() < self.want {
+            match create_route(api, params).await {
+                Ok(RouteBlob { route_id, blob }) => self.routes.push((route_id, blob)),
+                Err(e) => {
+                    eprintln!("could not top the route pool back up: {e}");
+                    break;
+                }
+            }
+        }
+        lost
     }
 }
 
@@ -234,17 +312,16 @@ pub async fn recv(
 
     let rc = routing_context(&api, &params)?;
 
-    let RouteBlob { mut route_id, blob } =
-        try_again_loop("creating route", || async { create_route(&api, &params).await }).await?;
+    let mut pool = Pool::build(&api, &params, cfg.pool).await?;
 
-    // Publish the blob under a stable DHT key so a dead route is recoverable.
+    // Publish the pool under a stable DHT key so a dead route is recoverable.
     // Failing to do so is not fatal -- the printed blob still works for a
     // single route's lifetime -- so the run continues without it.
     let rendezvous = match Rendezvous::open(&rc, &cfg.rendezvous_file).await {
-        Ok(r) => match r.publish(&blob).await {
+        Ok(r) => match r.publish(&pool.blobs()).await {
             Ok(()) => Some(r),
             Err(e) => {
-                eprintln!("could not publish the route to the rendezvous record: {e}");
+                eprintln!("could not publish the routes to the rendezvous record: {e}");
                 None
             }
         },
@@ -254,7 +331,12 @@ pub async fn recv(
         }
     };
 
-    println!("Route ready: {route_id}\n");
+    let blob = pool.blobs().into_iter().next().unwrap_or_default();
+    println!("Routes ready ({}):", pool.routes.len());
+    for (id, _) in &pool.routes {
+        println!("  {id}");
+    }
+    println!();
     println!("Writing arrivals to {}\n", cfg.out_dir.display());
     match &rendezvous {
         Some(r) => {
@@ -311,38 +393,35 @@ pub async fn recv(
                         }
                     }
                     VeilidUpdate::RouteChange(change) => {
-                        if change.dead_routes.contains(&route_id) {
-                            // With a rendezvous record this is survivable: build
-                            // a new route, rewrite the record, and keep serving.
-                            // Transfers in flight are keyed by transfer id, not
-                            // by route, so they resume rather than restart.
-                            let Some(r) = &rendezvous else {
-                                println!(
-                                    "\nOur route died and there is no rendezvous record, so the \
-                                     blob already handed out is stale. Restart to publish a fresh one."
-                                );
-                                break;
-                            };
-                            println!("\nOur route died; rebuilding and republishing.");
-                            let _ = api.release_private_route(route_id.clone());
-                            match create_route(&api, &params).await {
-                                Ok(RouteBlob { route_id: fresh, blob }) => {
-                                    route_id = fresh;
-                                    match r.publish(&blob).await {
-                                        Ok(()) => println!(
-                                            "Republished as {route_id}; senders will pick it up."
-                                        ),
-                                        Err(e) => {
-                                            println!("could not republish the route: {e}");
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("could not rebuild our route: {e}");
-                                    break;
-                                }
-                            }
+                        let dead: Vec<RouteId> = change
+                            .dead_routes
+                            .iter()
+                            .filter(|id| pool.holds(id))
+                            .cloned()
+                            .collect();
+                        if dead.is_empty() {
+                            continue;
+                        }
+                        // Survivable while any route in the pool is still up:
+                        // senders holding the published list fail over to one of
+                        // the others with no round trip at all. Transfers in
+                        // flight are keyed by transfer id, not by route, so they
+                        // carry on rather than restart.
+                        let lost = pool.replace_dead(&api, &params, &dead).await;
+                        println!("\n{lost} route(s) died; pool is now {}.", pool.routes.len());
+                        if pool.routes.is_empty() {
+                            println!("No routes left and none could be rebuilt. Restarting is the \
+                                      only way forward.");
+                            break;
+                        }
+                        let Some(r) = &rendezvous else {
+                            println!("No rendezvous record, so the blob already handed out is \
+                                      stale. Restart to publish a fresh one.");
+                            break;
+                        };
+                        match r.publish(&pool.blobs()).await {
+                            Ok(()) => println!("Republished {} route(s).", pool.routes.len()),
+                            Err(e) => println!("could not republish the pool: {e}"),
                         }
                     }
                     VeilidUpdate::Shutdown => break,
@@ -554,8 +633,12 @@ pub async fn send(
         }
     };
 
-    let mut remote = import_route(&api, &rc, &source, record.as_ref()).await?;
-    println!("Remote route: {remote}");
+    let mut routes = import_routes(&api, &rc, &source, record.as_ref()).await?;
+    let mut current = 0usize;
+    println!("Remote route(s): {}", routes.len());
+    for (i, r) in routes.iter().enumerate() {
+        println!("  {}{r}", if i == 0 { "* " } else { "  " });
+    }
     println!("{}\n", params.describe());
 
     for path in &cfg.files {
@@ -564,12 +647,18 @@ pub async fn send(
         // transfer and we resume from the chunks it is missing.
         let name = file_name_of(path);
         let xfer = xfer_id(&name);
+        let mut refreshes = 0u32;
         loop {
+            let remote = routes[current].clone();
             let outcome = tokio::select! {
-                r = send_one(&rc, &remote, path, &cfg, xfer) => {
-                    r?;
-                    Outcome::Done
-                }
+                r = send_one(&rc, &remote, path, &cfg, xfer) => match r {
+                    Ok(()) => Outcome::Done,
+                    Err(SendError::RouteUnusable(why)) => {
+                        println!("  {why}");
+                        Outcome::RemoteRouteDied
+                    }
+                    Err(SendError::Fatal(e)) => return Err(e),
+                },
                 () = watch_remote(&mut updates, &remote) => Outcome::RemoteRouteDied,
                 _ = done.recv() => {
                     println!("\nInterrupted.");
@@ -578,16 +667,43 @@ pub async fn send(
             };
             match outcome {
                 Outcome::Done => break,
-                Outcome::RemoteRouteDied if record.is_some() => {
-                    println!("  the remote route died; re-reading the rendezvous record");
-                    remote = import_route(&api, &rc, &source, record.as_ref()).await?;
-                    println!("  resuming on {remote}");
-                }
                 Outcome::RemoteRouteDied => {
-                    return Err("the remote route died mid-transfer and there is no rendezvous \
-                                record, so there is no way to learn its replacement. Restart the \
-                                receiver for a fresh blob, or use --rendezvous."
+                    // A spare from the published pool costs nothing to try: we
+                    // already hold it, so this is a local retry with no round
+                    // trip and no dependency on the receiver being reachable.
+                    current += 1;
+                    if current < routes.len() {
+                        println!(
+                            "  route died; failing over to spare {}/{}: {}",
+                            current + 1,
+                            routes.len(),
+                            routes[current]
+                        );
+                        continue;
+                    }
+                    // The pool is exhausted. Now it is worth a DHT round trip.
+                    if record.is_none() {
+                        return Err("the remote route died mid-transfer and there is no rendezvous \
+                                    record, so there is no way to learn its replacement. Restart \
+                                    the receiver for a fresh blob, or use --rendezvous."
+                            .into());
+                    }
+                    refreshes += 1;
+                    if refreshes > MAX_POOL_REFRESHES {
+                        return Err(format!(
+                            "{name}: every route in the rendezvous record has failed \
+                             {MAX_POOL_REFRESHES} refreshes running. The receiver is most likely \
+                             gone -- it would have republished by now if it were alive."
+                        )
                         .into());
+                    }
+                    println!(
+                        "  every published route is dead; re-reading the rendezvous record \
+                         ({refreshes}/{MAX_POOL_REFRESHES})"
+                    );
+                    routes = import_routes(&api, &rc, &source, record.as_ref()).await?;
+                    current = 0;
+                    println!("  resuming on {}", routes[current]);
                 }
             }
         }
@@ -600,6 +716,18 @@ enum Outcome {
     RemoteRouteDied,
 }
 
+/// Why a transfer attempt stopped.
+///
+/// The distinction is what makes a pool useful. Veilid only reports a route as
+/// dead when it decides to; long before that, control calls on it start failing
+/// with `could not get remote private route`. Treating that as fatal throws
+/// away perfectly good spares, so it is reported separately and retried on the
+/// next route.
+enum SendError {
+    RouteUnusable(String),
+    Fatal(Box<dyn std::error::Error>),
+}
+
 /// Resolve the receiver's current route: straight from the pasted blob, or from
 /// the rendezvous record.
 ///
@@ -607,28 +735,54 @@ enum Outcome {
 /// route we were told about last time, and the only reason to consult the
 /// record at all is that it may since have changed -- reading the cache would
 /// hand back exactly the stale blob we are trying to get away from.
-async fn import_route(
+async fn import_routes(
     api: &VeilidAPI,
     rc: &RoutingContext,
     source: &RouteSource,
     record: Option<&RecordKey>,
-) -> Result<RouteId, Box<dyn std::error::Error>> {
-    let blob = match (source, record) {
-        (RouteSource::Blob(b), _) => b.clone(),
+) -> Result<Vec<RouteId>, Box<dyn std::error::Error>> {
+    let blobs = match (source, record) {
+        (RouteSource::Blob(b), _) => vec![b.clone()],
         (RouteSource::Rendezvous(_), Some(key)) => {
             let value = try_again_loop("reading rendezvous record", || async {
                 rc.get_dht_value(key.clone(), 0, true).await
             })
             .await?
             .ok_or("the rendezvous record exists but has no route published in it yet")?;
-            value.data().to_vec()
+            let raw = value.data();
+            match Packet::decode(raw) {
+                Some(Packet::Routes { blobs }) => blobs,
+                // A receiver before the pool existed published a bare blob.
+                // It carries no magic, so it cannot be confused for a list.
+                _ => vec![raw.to_vec()],
+            }
         }
         (RouteSource::Rendezvous(_), None) => return Err("rendezvous record was never opened".into()),
     };
-    Ok(try_again_loop("importing remote route", || async {
-        api.import_remote_private_route(blob.clone())
-    })
-    .await?)
+
+    let mut routes = Vec::new();
+    let mut last_err = None;
+    for blob in &blobs {
+        match api.import_remote_private_route(blob.clone()) {
+            Ok(id) => routes.push(id),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if routes.is_empty() {
+        // Nothing imported cleanly. Retry the first one patiently, since the
+        // usual cause is the node not being ready rather than a bad blob.
+        let first = blobs.into_iter().next().ok_or_else(|| {
+            format!("no routes published{}",
+                    last_err.map(|e| format!(" and none importable: {e}")).unwrap_or_default())
+        })?;
+        routes.push(
+            try_again_loop("importing remote route", || async {
+                api.import_remote_private_route(first.clone())
+            })
+            .await?,
+        );
+    }
+    Ok(routes)
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -656,14 +810,17 @@ async fn send_one(
     path: &Path,
     cfg: &SendConfig,
     xfer: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+) -> Result<(), SendError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| SendError::Fatal(format!("{}: {e}", path.display()).into()))?;
     let name = file_name_of(path);
 
     let chunk_size = cfg.chunk.clamp(1, MAX_CHUNK_DATA);
     let chunk_count = bytes.len().div_ceil(chunk_size);
     if chunk_count > u32::MAX as usize {
-        return Err(format!("{name}: too many chunks; use a larger --chunk").into());
+        return Err(SendError::Fatal(
+            format!("{name}: too many chunks; use a larger --chunk").into(),
+        ));
     }
     let crc = crc32(&bytes);
 
@@ -707,10 +864,14 @@ async fn send_one(
         // Let whatever is still in flight land before calling it missing.
         tokio::time::sleep(Duration::from_millis(cfg.settle_ms)).await;
 
-        let reply = call(rc, remote, Packet::Status { xfer }.encode(0), "status").await?;
+        let reply = call(rc, remote, Packet::Status { xfer }.encode(0), "status")
+            .await
+            .map_err(|e| SendError::RouteUnusable(format!("status calls are failing ({e})")))?;
         let Some(Packet::StatusReply { state, missing_total, missing, .. }) = Packet::decode(&reply)
         else {
-            return Err(format!("{name}: the receiver answered a status query with something else").into());
+            return Err(SendError::Fatal(
+                format!("{name}: the receiver answered a status query with something else").into(),
+            ));
         };
         if first_pass_missing.is_none() {
             first_pass_missing = Some(missing_total);
@@ -726,10 +887,10 @@ async fn send_one(
             }
             _ => {
                 if missing.is_empty() {
-                    return Err(format!(
-                        "{name}: the receiver is {missing_total} chunk(s) short but named none of them"
-                    )
-                    .into());
+                    return Err(SendError::Fatal(
+                        format!("{name}: the receiver is {missing_total} chunk(s) short but named none of them")
+                            .into(),
+                    ));
                 }
                 pending = missing;
             }
@@ -737,12 +898,14 @@ async fn send_one(
 
         round += 1;
         if round > cfg.max_rounds {
-            return Err(format!(
-                "{name}: still {missing_total} chunk(s) short after {} repair pass(es); \
-                 try a lower --rate or a smaller --chunk",
-                cfg.max_rounds
-            )
-            .into());
+            return Err(SendError::Fatal(
+                format!(
+                    "{name}: still {missing_total} chunk(s) short after {} repair pass(es); \
+                     try a lower --rate or a smaller --chunk",
+                    cfg.max_rounds
+                )
+                .into(),
+            ));
         }
     }
 
@@ -766,14 +929,20 @@ async fn open_transfer(
     remote: &RouteId,
     manifest: &[u8],
     name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let reply = call(rc, remote, manifest.to_vec(), "manifest").await?;
+) -> Result<(), SendError> {
+    let reply = call(rc, remote, manifest.to_vec(), "manifest")
+        .await
+        .map_err(|e| SendError::RouteUnusable(format!("manifest calls are failing ({e})")))?;
     match Packet::decode(&reply) {
         Some(Packet::ManifestOk { accepted: true, .. }) => Ok(()),
-        Some(Packet::ManifestOk { message, .. }) => {
-            Err(format!("{name}: the receiver refused it — {message}").into())
-        }
-        _ => Err(format!("{name}: the receiver answered the manifest with something else").into()),
+        // A refusal is the receiver's considered answer, not a broken path:
+        // another route would be refused in exactly the same way.
+        Some(Packet::ManifestOk { message, .. }) => Err(SendError::Fatal(
+            format!("{name}: the receiver refused it — {message}").into(),
+        )),
+        _ => Err(SendError::Fatal(
+            format!("{name}: the receiver answered the manifest with something else").into(),
+        )),
     }
 }
 
@@ -962,7 +1131,7 @@ mod tests {
     #[test]
     fn the_manifest_and_the_chunking_have_to_agree() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
         let ask = |total_len: u64, chunk_size: u32, chunk_count: u32| {
             Packet::Manifest {
                 xfer: 1,
@@ -996,7 +1165,7 @@ mod tests {
     #[test]
     fn an_unknown_transfer_says_so_rather_than_lying_about_progress() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
         let reply = answer(&mut transfers, &HashSet::new(), &cfg, &Packet::Status { xfer: 7 }.encode(0)).unwrap();
         match Packet::decode(&reply) {
             Some(Packet::StatusReply { state, .. }) => assert_eq!(state, XFER_UNKNOWN),
@@ -1007,7 +1176,7 @@ mod tests {
     #[test]
     fn a_retried_manifest_keeps_the_progress_already_made() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -1020,7 +1189,7 @@ mod tests {
     #[test]
     fn status_records_the_first_pass_loss_once() {
         let mut transfers = HashMap::new();
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
         let manifest =
             Packet::Manifest { xfer: 1, total_len: 100, chunk_size: 10, chunk_count: 10, crc32: 0, name: "x".into() }
                 .encode(0);
@@ -1054,7 +1223,7 @@ mod tests {
         let mut transfers = HashMap::new();
         let mut completed = HashSet::new();
         completed.insert(1u64);
-        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into() };
+        let cfg = RecvConfig { out_dir: ".".into(), max_bytes: 1024, rendezvous_file: ".".into(), pool: 1 };
         let reply =
             answer(&mut transfers, &completed, &cfg, &Packet::Status { xfer: 1 }.encode(0)).unwrap();
         match Packet::decode(&reply) {

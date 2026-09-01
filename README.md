@@ -97,10 +97,29 @@ restarts. The key is kept with its owner keypair in `.veilid/recv/rendezvous`
 beside the binary, so restarting the receiver reuses the same key rather than
 minting a new one.
 
-When a route dies mid-transfer the sender re-reads the record, imports whatever
-is there now, and **resumes the same transfer** — transfers are keyed by a
-random id rather than by route, and the receiver answers a repeated manifest by
-keeping the chunks it already has. Nothing already delivered is sent twice.
+The receiver keeps a **pool** of routes (`--pool`, default 3) and publishes all
+of them at once, so the sender already holds the alternatives. Failover is then
+a local decision — try the next one — with no round trip and no dependence on
+the receiver being reachable at that instant. Only when every published route
+has failed is a DHT re-read worth the latency.
+
+The escalation, cheapest first:
+
+1. **Spare from the pool.** Instant, local, cannot fail on its own.
+2. **Re-read the record.** One DHT fetch, for when the whole pool is stale.
+3. **Give up**, after three fruitless refreshes — a live receiver would have
+   republished by then, so the diagnosis is that it is gone.
+
+Two things count as a route failing. Veilid reporting it dead is the obvious
+one, but it decides that lazily: long before the event fires, control calls on
+that route start returning `could not get remote private route`. Both trigger
+failover. A manifest the receiver *refuses* does not — another route would be
+refused identically.
+
+Whatever the sender comes back on, it **resumes the same transfer** rather than
+restarting: transfers are keyed by a random id rather than by route, and the
+receiver answers a repeated manifest by keeping the chunks it already has.
+Nothing already delivered is sent twice.
 
 Completed files are written to `--out` (default `./inbox`), never overwriting:
 a second `photo.jpg` lands as `photo-1.jpg`. Both ends print what the path cost
@@ -137,6 +156,7 @@ path the question arrived on. Only the receiver has to publish a blob.
 |---|---|---|
 | `--out <dir>` | `inbox` | *(recv)* Where completed files are written. Created if missing. |
 | `--max-bytes` | 268435456 | *(recv)* Refuse a transfer larger than this. The file is assembled in memory, and anyone holding the blob can open one. |
+| `--pool <n>` | 3 | *(recv)* How many routes to keep published at once. Spares let a sender fail over locally instead of going back to the DHT. Clamped to 1–8. |
 | `--chunk` | 16384 | *(send)* Payload bytes per chunk. Larger is fewer round trips; smaller survives a lossy path better. Capped at 32751, what one `app_message` holds after the header. |
 | `--rate` | 20 | *(send)* Chunks per second. `--rate` × `--chunk` is the offered throughput; the default asks for about 320 KiB/s. |
 | `--settle-ms` | 1500 | *(send)* How long to wait after a pass before asking what is missing. Wants to be a couple of round trips of the measured RTT. |

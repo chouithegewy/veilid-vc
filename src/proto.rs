@@ -28,6 +28,7 @@ pub const KIND_MANIFEST_OK: u8 = 5;
 pub const KIND_CHUNK: u8 = 6;
 pub const KIND_STATUS: u8 = 7;
 pub const KIND_STATUS_REPLY: u8 = 8;
+pub const KIND_ROUTES: u8 = 9;
 
 /// magic + kind
 pub const HEADER_LEN: usize = 5;
@@ -122,6 +123,15 @@ pub enum Packet {
     /// The answer to a `Status`. `missing` is truncated to what fits one
     /// message; `missing_total` is the honest count.
     StatusReply { xfer: u64, state: u8, missing_total: u32, missing: Vec<u32> },
+
+    /// The value published in the rendezvous record: every route the receiver
+    /// currently has, most-preferred first.
+    ///
+    /// This never travels over a route; it is what a DHT subkey holds. A list
+    /// rather than one blob is what makes failover free: the sender already
+    /// holds the alternatives, so a dead route costs a local retry instead of
+    /// a DHT round trip.
+    Routes { blobs: Vec<Vec<u8>> },
 }
 
 fn put_u64(buf: &mut Vec<u8>, v: u64) {
@@ -231,6 +241,17 @@ impl Packet {
                 put_u64(&mut buf, *xfer);
                 return buf;
             }
+            Packet::Routes { blobs } => {
+                buf.push(KIND_ROUTES);
+                let n = blobs.len().min(u16::MAX as usize);
+                buf.extend_from_slice(&(n as u16).to_le_bytes());
+                for b in &blobs[..n] {
+                    let len = b.len().min(u16::MAX as usize);
+                    buf.extend_from_slice(&(len as u16).to_le_bytes());
+                    buf.extend_from_slice(&b[..len]);
+                }
+                return buf;
+            }
             Packet::StatusReply { xfer, state, missing_total, missing } => {
                 buf.push(KIND_STATUS_REPLY);
                 put_u64(&mut buf, *xfer);
@@ -306,6 +327,25 @@ impl Packet {
             KIND_STATUS if buf.len() >= HEADER_LEN + 8 => Some(Packet::Status {
                 xfer: get_u64(buf, HEADER_LEN),
             }),
+            KIND_ROUTES if buf.len() >= HEADER_LEN + 2 => {
+                let n = u16::from_le_bytes([buf[HEADER_LEN], buf[HEADER_LEN + 1]]) as usize;
+                let mut blobs = Vec::with_capacity(n.min(64));
+                let mut off = HEADER_LEN + 2;
+                for _ in 0..n {
+                    if buf.len() < off + 2 {
+                        return None;
+                    }
+                    let len = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+                    let start = off + 2;
+                    let end = start.checked_add(len)?;
+                    if buf.len() < end {
+                        return None;
+                    }
+                    blobs.push(buf[start..end].to_vec());
+                    off = end;
+                }
+                Some(Packet::Routes { blobs })
+            }
             KIND_STATUS_REPLY if buf.len() >= STATUS_REPLY_HEADER_LEN => {
                 let listed = get_u32(buf, HEADER_LEN + 13) as usize;
                 let start = STATUS_REPLY_HEADER_LEN;
@@ -471,6 +511,38 @@ mod tests {
         // Claim far more indices than the message actually carries.
         enc[HEADER_LEN + 13..HEADER_LEN + 17].copy_from_slice(&9999u32.to_le_bytes());
         assert!(Packet::decode(&enc).is_none());
+    }
+
+    #[test]
+    fn routes_list_roundtrips() {
+        let blobs = vec![vec![1u8; 900], vec![2u8; 1100], vec![3u8; 5]];
+        match Packet::decode(&Packet::Routes { blobs: blobs.clone() }.encode(0)) {
+            Some(Packet::Routes { blobs: got }) => assert_eq!(got, blobs),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_routes_list_is_valid() {
+        match Packet::decode(&Packet::Routes { blobs: vec![] }.encode(0)) {
+            Some(Packet::Routes { blobs }) => assert!(blobs.is_empty()),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_routes_list_with_a_lying_length_is_rejected() {
+        let mut enc = Packet::Routes { blobs: vec![vec![7u8; 10]] }.encode(0);
+        // Claim a blob far longer than the message actually carries.
+        enc[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&9999u16.to_le_bytes());
+        assert!(Packet::decode(&enc).is_none());
+    }
+
+    #[test]
+    fn a_raw_blob_does_not_decode_as_a_routes_list() {
+        // v0.2.0 receivers published a bare route blob. It has no magic, so it
+        // must not be mistaken for a list -- the sender falls back on it.
+        assert!(Packet::decode(&[0x41, 0x52, 0x10, 0x64, 0x50]).is_none());
     }
 
     #[test]
