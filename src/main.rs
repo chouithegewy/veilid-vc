@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = update_tx.send(Stamped { at_us: proto::now_us(), update });
     };
 
-    let api = Box::pin(api_startup(Arc::new(callback), config(namespace)?)).await?;
+    let api = start_node(Arc::new(callback), config(namespace)?, namespace).await?;
     api.attach().await?;
 
     let result = match cli.command {
@@ -274,6 +274,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     api.shutdown().await;
     result
+}
+
+/// Start the node, waiting out a protected store that has not been released yet.
+///
+/// The insecure keyring is one file per namespace, and a node that was just
+/// stopped keeps it until its shutdown finishes -- which outlives the process
+/// vanishing from `ps`. Restarting promptly therefore fails with "failed to
+/// create insecure keyring", which says nothing about the actual cause: either
+/// another `veilid-vc <namespace>` is running, or the last one is still letting
+/// go. The first is worth reporting plainly; the second is worth waiting for.
+async fn start_node(
+    callback: UpdateCallback,
+    config: VeilidConfig,
+    namespace: &str,
+) -> Result<VeilidAPI, Box<dyn std::error::Error>> {
+    const ATTEMPTS: u32 = 15;
+    let mut waited = false;
+    for attempt in 1..=ATTEMPTS {
+        let err = match Box::pin(api_startup(callback.clone(), config.clone())).await {
+            Ok(api) => {
+                if waited {
+                    eprintln!(" released.");
+                }
+                return Ok(api);
+            }
+            Err(e) => e,
+        };
+        if !err.to_string().contains("keyring") {
+            return Err(err.into());
+        }
+        if attempt == ATTEMPTS {
+            return Err(format!(
+                "could not open the protected store for `{namespace}`. Another \
+                 `veilid-vc {namespace}` is probably still running -- each subcommand keeps its \
+                 own keyring, so two of the same one collide. Find it with \
+                 `ps -eo pid,args | grep veilid-vc` and stop it with `kill -INT <pid>`."
+            )
+            .into());
+        }
+        if !waited {
+            eprint!("Waiting for the previous {namespace} node to release its keyring...");
+            waited = true;
+        } else {
+            eprint!(".");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+    unreachable!()
 }
 
 /// Where per-namespace state lives: beside the executable, like the veilid

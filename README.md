@@ -265,6 +265,27 @@ accounting, that jitter is immune to a constant clock offset, that a file
 reassembles out of order, and that a hostile file name cannot write outside
 `--out`.
 
+## If it will not start
+
+```
+failed to create insecure keyring
+```
+
+Each subcommand keeps its own protected store, so two `recv`s collide but a
+`recv` and a `send` on one machine do not. A node that was just stopped holds
+its keyring until shutdown finishes, which outlives the process leaving `ps`,
+so the tool waits about ten seconds for that before giving up and naming the
+namespace. If it does give up, something else is holding it:
+
+```
+ps -eo pid,args | grep veilid-vc
+kill -INT <pid>          # SIGINT, not -9, so it releases cleanly
+```
+
+The other cause is the executable's directory not being writable — state lives
+in `<exe_dir>/.veilid/<namespace>/`, so a binary in `/usr/local/bin` fails this
+way for a non-root user.
+
 ## Caveats
 
 `always_use_insecure_storage` is set, because this tool holds nothing worth
