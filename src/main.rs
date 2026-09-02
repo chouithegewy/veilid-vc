@@ -22,9 +22,16 @@
 // runs past the default limit when we spawn an `app_message` future.
 #![recursion_limit = "256"]
 
+/// The single page the local server hands the browser. It renders itself
+/// from the JSON API; the node never generates markup.
+pub const APP_HTML: &str = include_str!("app.html");
+
 mod proto;
 mod roles;
+mod social;
+mod node;
 mod stats;
+mod web;
 mod transfer;
 
 use clap::{Parser, Subcommand};
@@ -112,6 +119,16 @@ enum Command {
         /// than leaving the pool alone. Kept for experimentation.
         #[arg(long, default_value_t = 0)]
         rotate_secs: u64,
+    },
+    /// Run a social node: your wall in the DHT, and a local page to drive it.
+    Serve {
+        /// Port for the local page. Bound to loopback only.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+
+        /// How many private routes to publish for people to message you on.
+        #[arg(long, default_value_t = 2)]
+        pool: usize,
     },
     /// Push files at a receiver over its private route.
     Send {
@@ -215,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Listen => "listen",
         Command::Probe { .. } => "probe",
         Command::Recv { .. } => "recv",
+        Command::Serve { .. } => "serve",
         Command::Send { .. } => "send",
     };
 
@@ -254,6 +272,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rotate_secs,
             };
             transfer::recv(api.clone(), update_rx, params, cfg, done_rx).await
+        }
+        Command::Serve { port, pool } => {
+            let cfg = node::ServeConfig {
+                port,
+                identity_file: state_dir().join(".veilid/serve/identity"),
+                follows_file: state_dir().join(".veilid/serve/follows"),
+                pool: pool.clamp(1, 8),
+            };
+            node::serve(api.clone(), update_rx, params, cfg, done_rx).await
         }
         Command::Send { connect, rendezvous, files, chunk, rate, settle_ms, rounds } => {
             let source = match (connect, rendezvous) {

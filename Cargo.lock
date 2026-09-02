@@ -3493,6 +3493,8 @@ dependencies = [
  "clap",
  "ctrlc",
  "data-encoding",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
  "veilid-core",

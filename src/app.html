@@ -1,0 +1,258 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>veilid social</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee;
+    --dim:#9aa3b2; --accent:#7aa2f7; --ok:#7ec699; --bad:#f7768e;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#dfe3ea; --text:#1a1d24;
+            --dim:#5b6472; --accent:#2f6fd0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .key { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim);
+         word-break:break-all; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .row > * { flex:1 1 auto; min-width:0; }
+  input, textarea, button {
+    font:inherit; color:var(--text); background:var(--bg);
+    border:1px solid var(--line); border-radius:8px; padding:9px 11px;
+  }
+  textarea { width:100%; resize:vertical; min-height:74px; }
+  button { background:var(--accent); color:#fff; border:0; cursor:pointer; flex:0 0 auto;
+           padding:9px 16px; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  nav { display:flex; gap:6px; margin-bottom:14px; }
+  nav button { background:transparent; color:var(--dim); border:1px solid var(--line); }
+  nav button[aria-current="true"] { background:var(--accent); color:#fff; border-color:transparent; }
+  .post { border-bottom:1px solid var(--line); padding:12px 0; }
+  .post:last-child { border-bottom:0; }
+  .meta { font-size:12.5px; color:var(--dim); margin-bottom:4px; }
+  .who { color:var(--text); font-weight:600; }
+  .text { white-space:pre-wrap; word-wrap:break-word; }
+  .muted { color:var(--dim); }
+  .note { font-size:13px; padding:8px 11px; border-radius:8px; margin-bottom:12px; }
+  .note.err { background:rgba(247,118,142,.14); color:var(--bad); }
+  .note.ok  { background:rgba(126,198,153,.14); color:var(--ok); }
+  .follow { display:flex; gap:8px; align-items:center; padding:7px 0;
+            border-bottom:1px solid var(--line); }
+  .follow .key { flex:1; }
+  label { font-size:12.5px; color:var(--dim); display:block; margin-bottom:4px; }
+</style>
+
+<div class="wrap">
+  <div class="card">
+    <h1 id="me-name">…</h1>
+    <div id="me-bio" class="muted"></div>
+    <div style="margin-top:8px">
+      <label>Your key — share it so others can follow you</label>
+      <div class="key" id="me-key"></div>
+    </div>
+  </div>
+
+  <nav>
+    <button data-tab="feed" aria-current="true">Feed</button>
+    <button data-tab="compose">Post</button>
+    <button data-tab="people">People</button>
+    <button data-tab="messages">Messages</button>
+    <button data-tab="profile">Profile</button>
+  </nav>
+
+  <div id="note"></div>
+  <div id="view"></div>
+</div>
+
+<script>
+// Everything below builds the page from JSON the node hands us. The node
+// renders no markup: what you see is the DHT's contents, shaped here.
+const $ = (s, r = document) => r.querySelector(s);
+let tab = "feed";
+let me = { key: "", name: "", bio: "", follows: [] };
+
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const short = k => k.length > 24 ? k.slice(0, 14) + "…" + k.slice(-6) : k;
+
+function when(us) {
+  const d = new Date(Number(us) / 1000);
+  if (!isFinite(d)) return "";
+  const secs = (Date.now() - d.getTime()) / 1000;
+  if (secs < 60) return "just now";
+  if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+  return d.toLocaleString();
+}
+
+function note(msg, kind = "err") {
+  $("#note").innerHTML = msg ? `<div class="note ${kind}">${esc(msg)}</div>` : "";
+  if (msg) setTimeout(() => { $("#note").innerHTML = ""; }, 6000);
+}
+
+async function api(path, body) {
+  const opts = body
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : {};
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+  return data;
+}
+
+function postHTML(item) {
+  const who = item.author_name || short(item.author_key);
+  const mine = item.author_key === me.key;
+  return `<div class="post">
+    <div class="meta">
+      <span class="who">${esc(who)}</span>${mine ? " (you)" : ""}
+      · ${esc(when(item.ts_us))}
+    </div>
+    <div class="text">${esc(item.text)}</div>
+  </div>`;
+}
+
+const views = {
+  async feed() {
+    $("#view").innerHTML = `<div class="card muted">Reading walls from the DHT…</div>`;
+    const { items } = await api("/api/feed");
+    $("#view").innerHTML = items.length
+      ? `<div class="card">${items.map(postHTML).join("")}</div>`
+      : `<div class="card muted">Nothing yet. Post something, or follow a
+         node's key under <b>People</b>.</div>`;
+  },
+
+  async compose() {
+    $("#view").innerHTML = `<div class="card">
+      <label>Public post — written to your DHT record, readable by anyone with your key</label>
+      <textarea id="text" placeholder="Say something"></textarea>
+      <div class="row" style="margin-top:9px"><span></span>
+        <button id="send">Post</button></div>
+    </div>`;
+    $("#send").onclick = async () => {
+      const text = $("#text").value.trim();
+      if (!text) return;
+      $("#send").disabled = true;
+      try {
+        await api("/api/post", { text });
+        $("#text").value = "";
+        note("Posted.", "ok");
+        await show("feed");
+      } catch (e) { note(e.message); }
+      finally { const b = $("#send"); if (b) b.disabled = false; }
+    };
+  },
+
+  async people() {
+    const list = me.follows.map(k =>
+      `<div class="follow"><span class="key">${esc(k)}</span>
+       <button class="ghost" data-unfollow="${esc(k)}">Unfollow</button></div>`).join("");
+    $("#view").innerHTML = `<div class="card">
+      <label>Follow a node by its key</label>
+      <div class="row">
+        <input id="key" placeholder="VLD0:…" style="flex:1">
+        <button id="follow">Follow</button>
+      </div>
+    </div>
+    <div class="card">
+      <label>Following (${me.follows.length})</label>
+      ${list || '<div class="muted">Nobody yet.</div>'}
+    </div>`;
+    $("#follow").onclick = async () => {
+      try {
+        me.follows = (await api("/api/follow", { key: $("#key").value.trim() })).follows;
+        note("Following.", "ok");
+        await show("people");
+      } catch (e) { note(e.message); }
+    };
+    document.querySelectorAll("[data-unfollow]").forEach(b => {
+      b.onclick = async () => {
+        me.follows = (await api("/api/unfollow", { key: b.dataset.unfollow })).follows;
+        await show("people");
+      };
+    });
+  },
+
+  async messages() {
+    const { messages } = await api("/api/inbox");
+    const items = messages.slice().reverse().map(m => `<div class="post">
+      <div class="meta"><span class="who">${esc(m.from_name || short(m.from_key))}</span>
+        · ${esc(when(m.ts_us))}</div>
+      <div class="text">${esc(m.text)}</div>
+      <div class="key" style="margin-top:4px">${esc(m.from_key)}</div>
+    </div>`).join("");
+    $("#view").innerHTML = `<div class="card">
+      <label>Send a private message — over a private route, never into the DHT</label>
+      <input id="to" placeholder="Their key (VLD0:…)" style="width:100%;margin-bottom:8px">
+      <textarea id="dm" placeholder="Message"></textarea>
+      <div class="row" style="margin-top:9px"><span></span><button id="sendDm">Send</button></div>
+    </div>
+    <div class="card"><label>Received (${messages.length})</label>
+      ${items || '<div class="muted">No messages.</div>'}</div>`;
+    $("#sendDm").onclick = async () => {
+      const to = $("#to").value.trim(), text = $("#dm").value.trim();
+      if (!to || !text) return;
+      $("#sendDm").disabled = true;
+      try {
+        await api("/api/dm", { to, text });
+        $("#dm").value = "";
+        note("Delivered.", "ok");
+      } catch (e) { note(e.message); }
+      finally { const b = $("#sendDm"); if (b) b.disabled = false; }
+    };
+  },
+
+  async profile() {
+    $("#view").innerHTML = `<div class="card">
+      <label>Display name</label>
+      <input id="name" value="${esc(me.name)}" style="width:100%;margin-bottom:10px">
+      <label>Bio</label>
+      <textarea id="bio">${esc(me.bio)}</textarea>
+      <div class="row" style="margin-top:9px"><span></span><button id="save">Save</button></div>
+    </div>`;
+    $("#save").onclick = async () => {
+      try {
+        await api("/api/profile", { name: $("#name").value, bio: $("#bio").value });
+        note("Profile published.", "ok");
+        await refreshMe();
+      } catch (e) { note(e.message); }
+    };
+  },
+};
+
+async function refreshMe() {
+  me = await api("/api/me");
+  $("#me-name").textContent = me.name || "(unnamed node)";
+  $("#me-bio").textContent = me.bio || "";
+  $("#me-key").textContent = me.key;
+}
+
+async function show(name) {
+  tab = name;
+  document.querySelectorAll("nav button").forEach(b =>
+    b.setAttribute("aria-current", String(b.dataset.tab === name)));
+  try { await views[name](); }
+  catch (e) { $("#view").innerHTML = `<div class="card muted">${esc(e.message)}</div>`; }
+}
+
+document.querySelectorAll("nav button").forEach(b =>
+  b.onclick = () => show(b.dataset.tab));
+
+(async () => {
+  try { await refreshMe(); } catch (e) { note(e.message); }
+  await show("feed");
+  // The DHT is the only source of truth, and other people write to it, so poll.
+  setInterval(async () => {
+    if (tab === "feed" || tab === "messages") {
+      try { await views[tab](); } catch {}
+    }
+  }, 20000);
+})();
+</script>

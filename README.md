@@ -71,6 +71,43 @@ Both ends print a report on exit. Ctrl-C ends a run early.
 Attaching to the public network takes 30–60 seconds before a route can be built;
 `Waiting for network...` is normal.
 
+## A social node
+
+```
+cargo run --release -- serve --port 8080
+```
+
+It prints a key and serves a page on loopback. The key is your identity: share
+it and people can follow you, and it survives restarts because the owner
+keypair is kept on disk.
+
+**One DHT record is your wall.** Subkey 0 holds the profile — display name, bio,
+post count, and the private-route blobs people can reach you on. Subkeys 1..63
+hold posts in a ring, so a wall keeps its last 63 and older ones age out. That
+is the whole storage layer: following someone is remembering their key, and
+reading their feed is reading their subkeys. Nothing holds a copy on your
+behalf.
+
+**The node serves JSON; the page renders itself.** `/api/me`, `/api/feed`,
+`/api/post`, `/api/follow`, `/api/unfollow`, `/api/dm`, `/api/inbox`. No markup
+is generated server-side, so what a reader sees is a function of what is in the
+DHT rather than of what a server decided to say. Post text arrives from
+strangers' records, so everything is escaped before it reaches the DOM.
+
+**Public posts go in the DHT. Private messages do not.** A direct message is an
+`app_call` over one of the recipient's published routes — a record anyone can
+read is the wrong place for private mail. Because the routes live in the
+profile and the node republishes it when a route dies, messages keep arriving
+across route churn, which is the same rendezvous trick the file transfer uses.
+
+The HTTP server binds loopback only, and that is load-bearing rather than
+tidiness: the API can post as you and read your messages, with no
+authentication in front of it. It is safe exactly as long as nothing off the
+machine can reach it.
+
+Two nodes cannot share one machine — both would use the `serve` namespace and
+collide on its keyring. Run the second one elsewhere.
+
 ## Sending files
 
 The receiver publishes a route the same way the listener does:

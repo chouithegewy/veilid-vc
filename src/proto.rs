@@ -29,6 +29,7 @@ pub const KIND_CHUNK: u8 = 6;
 pub const KIND_STATUS: u8 = 7;
 pub const KIND_STATUS_REPLY: u8 = 8;
 pub const KIND_ROUTES: u8 = 9;
+pub const KIND_SOCIAL: u8 = 10;
 
 /// magic + kind
 pub const HEADER_LEN: usize = 5;
@@ -123,6 +124,15 @@ pub enum Packet {
     /// The answer to a `Status`. `missing` is truncated to what fits one
     /// message; `missing_total` is the honest count.
     StatusReply { xfer: u64, state: u8, missing_total: u32, missing: Vec<u32> },
+
+    /// A social-layer message: JSON over a private route, used for anything
+    /// that must not sit in the DHT. Private messages are the reason -- a
+    /// record anyone can read is the wrong place for them.
+    ///
+    /// The payload is JSON rather than fixed offsets so the social protocol
+    /// can gain fields without a wire-format change; `proto` stays the framing
+    /// and does not need to know what a direct message is.
+    Social { json: Vec<u8> },
 
     /// The value published in the rendezvous record: every route the receiver
     /// currently has, most-preferred first.
@@ -241,6 +251,12 @@ impl Packet {
                 put_u64(&mut buf, *xfer);
                 return buf;
             }
+            Packet::Social { json } => {
+                buf.push(KIND_SOCIAL);
+                let take = json.len().min(MAX_APP_MESSAGE - HEADER_LEN);
+                buf.extend_from_slice(&json[..take]);
+                return buf;
+            }
             Packet::Routes { blobs } => {
                 buf.push(KIND_ROUTES);
                 let n = blobs.len().min(u16::MAX as usize);
@@ -327,6 +343,7 @@ impl Packet {
             KIND_STATUS if buf.len() >= HEADER_LEN + 8 => Some(Packet::Status {
                 xfer: get_u64(buf, HEADER_LEN),
             }),
+            KIND_SOCIAL => Some(Packet::Social { json: buf[HEADER_LEN..].to_vec() }),
             KIND_ROUTES if buf.len() >= HEADER_LEN + 2 => {
                 let n = u16::from_le_bytes([buf[HEADER_LEN], buf[HEADER_LEN + 1]]) as usize;
                 let mut blobs = Vec::with_capacity(n.min(64));
@@ -543,6 +560,21 @@ mod tests {
         // v0.2.0 receivers published a bare route blob. It has no magic, so it
         // must not be mistaken for a list -- the sender falls back on it.
         assert!(Packet::decode(&[0x41, 0x52, 0x10, 0x64, 0x50]).is_none());
+    }
+
+    #[test]
+    fn a_social_payload_roundtrips() {
+        let json = br#"{"t":"dm","text":"hello"}"#.to_vec();
+        match Packet::decode(&Packet::Social { json: json.clone() }.encode(0)) {
+            Some(Packet::Social { json: got }) => assert_eq!(got, json),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_social_payload_is_truncated_not_rejected_by_the_coder() {
+        let enc = Packet::Social { json: vec![b'x'; MAX_APP_MESSAGE * 2] }.encode(0);
+        assert_eq!(enc.len(), MAX_APP_MESSAGE, "must still fit one app_message");
     }
 
     #[test]
